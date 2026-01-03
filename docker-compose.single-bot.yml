@@ -1,0 +1,49 @@
+# Single Bot Deployment
+#
+# Use this when deploying individual bots on separate machines.
+# Each machine only runs one bot + optional local Redis.
+#
+# Usage:
+#   # On Machine A (Vega):
+#   BOT=vega docker-compose -f docker-compose.single-bot.yml up -d
+#
+#   # On Machine B (Altair):
+#   BOT=altair docker-compose -f docker-compose.single-bot.yml up -d
+#
+# For shared Redis across machines, set REDIS_URL in .env to point
+# to a central Redis instance instead of using the local one.
+
+services:
+  # Local Redis (optional - use central Redis for multi-machine)
+  redis:
+    image: redis:7-alpine
+    container_name: hyperion-redis-local
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    profiles:
+      - with-redis
+
+  # Generic bot service - specify which bot via BOT env var
+  bot:
+    build:
+      context: .
+      dockerfile: ${BOT:-vega}/Dockerfile
+    container_name: hyperion-${BOT:-vega}
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+    depends_on:
+      - redis
+    volumes:
+      # For Altair session persistence
+      - bot-data:/root/.hyperion
+
+volumes:
+  redis-data:
+  bot-data:

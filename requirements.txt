@@ -1,0 +1,15 @@
+discord.py
+pexpect
+psutil
+python-dotenv
+
+# LLM Providers (install the one you need)
+google-genai  # For Gemini
+# openai>=1.0.0  # For OpenAI (optional)
+# anthropic>=0.18.0  # For Anthropic (optional)
+
+# Redis (optional - enables persistence features)
+redis
+
+# Browser automation for Canopus
+playwright

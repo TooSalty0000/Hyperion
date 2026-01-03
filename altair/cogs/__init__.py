@@ -1,0 +1,1 @@
+"""Altair Discord cogs."""

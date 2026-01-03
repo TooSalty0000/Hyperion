@@ -1,0 +1,165 @@
+# =============================================================================
+# Hyperion .gitignore - Security-focused exclusions
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Python
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# -----------------------------------------------------------------------------
+# Environment & Secrets (CRITICAL - Never commit these!)
+# -----------------------------------------------------------------------------
+.env
+.env.*
+.env.local
+.env.*.local
+.env.docker
+.env.local.docker
+*.env
+
+# API Keys & Tokens
+**/token.json
+**/token*.json
+**/*_token.json
+*.token
+
+# Google OAuth & Credentials
+**/credentials.json
+**/client_secret*.json
+**/oauth*.json
+
+# SSH & SSL Keys
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+*.pub
+
+# Other secrets
+secrets/
+.secrets/
+*.secret
+*_secret.*
+
+# -----------------------------------------------------------------------------
+# Testing & Coverage
+# -----------------------------------------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# -----------------------------------------------------------------------------
+# IDE & Editor
+# -----------------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# -----------------------------------------------------------------------------
+# OS Generated
+# -----------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# -----------------------------------------------------------------------------
+# Claude Code & AI Assistants
+# -----------------------------------------------------------------------------
+.claude/
+CLAUDE.md
+
+# -----------------------------------------------------------------------------
+# Logs & Databases
+# -----------------------------------------------------------------------------
+*.log
+logs/
+*.sqlite
+*.sqlite3
+*.db
+
+# Redis dumps
+dump.rdb
+
+# -----------------------------------------------------------------------------
+# Temporary & Cache
+# -----------------------------------------------------------------------------
+tmp/
+temp/
+.cache/
+*.tmp
+*.temp
+*.bak
+
+# -----------------------------------------------------------------------------
+# Docker (local overrides)
+# -----------------------------------------------------------------------------
+docker-compose.override.yml
+docker-compose.*.local.yml
+
+# -----------------------------------------------------------------------------
+# Project-specific exclusions
+# -----------------------------------------------------------------------------
+# Polaris Google Calendar credentials (explicitly listed)
+polaris/credentials.json
+
+# Local Hyperion user data (OAuth tokens stored here)
+# This is at ~/.hyperion/ but just in case someone copies it
+.hyperion/
+
+# Screenshots may contain sensitive info
+screenshots/*.png
+screenshots/*.jpg
+!screenshots/.gitkeep
+
+# Any local notes or scratch files
+NOTES.md
+TODO.local.md
+scratch/

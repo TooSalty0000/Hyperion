@@ -1,0 +1,54 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv
+venv
+ENV
+env
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Environment files (use env_file in docker-compose instead)
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.egg-info
+dist
+build
+
+# Logs
+*.log
+logs/
+
+# Test/Coverage
+.pytest_cache
+.coverage
+htmlcov
+
+# Local data
+*.db
+*.sqlite
+
+# Documentation
+docs/_build
+
+# Temp files
+tmp/
+temp/
