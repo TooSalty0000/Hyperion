@@ -12,6 +12,20 @@ from .session import (
     CreateSessionTool,
     TerminateSessionTool,
     SwitchSessionTool,
+    SetSessionNoteTool,
+    GetSessionNoteTool,
+)
+from .tunnel import (
+    StartTunnelTool,
+    StopTunnelTool,
+    ListTunnelsTool,
+)
+from .navigation import (
+    ListDirectoryTool,
+    GetCurrentDirectoryTool,
+    ReadFileTool,
+    FindFilesTool,
+    FileInfoTool,
 )
 
 __all__ = [
@@ -26,4 +40,16 @@ __all__ = [
     "CreateSessionTool",
     "TerminateSessionTool",
     "SwitchSessionTool",
+    "SetSessionNoteTool",
+    "GetSessionNoteTool",
+    # Tunnel management (ngrok)
+    "StartTunnelTool",
+    "StopTunnelTool",
+    "ListTunnelsTool",
+    # Navigation (read-only)
+    "ListDirectoryTool",
+    "GetCurrentDirectoryTool",
+    "ReadFileTool",
+    "FindFilesTool",
+    "FileInfoTool",
 ]

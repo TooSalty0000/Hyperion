@@ -13,3 +13,6 @@ redis
 
 # Browser automation for Canopus
 playwright
+
+# HTTP client for ngrok API
+httpx

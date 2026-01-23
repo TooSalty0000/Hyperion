@@ -24,6 +24,7 @@ class SessionData:
     workspace_dir: Optional[str] = None
     command: Optional[str] = None
     project_name: Optional[str] = None  # Associated project name for session lookup
+    notes: Optional[str] = None  # Altair's notes about what this session is for
 
 
 class SessionStore(ABC):

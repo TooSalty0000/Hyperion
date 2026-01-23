@@ -1,10 +1,48 @@
 """Chime-in evaluation for collaborative agent responses."""
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import List, Optional
+from typing import Dict, List, Optional
+
+
+# Mapping from text descriptions to actual emoji
+REACTION_EMOJI_MAP = {
+    "checkmark": "\u2705",
+    "check": "\u2705",
+    "thumbsup": "\U0001F44D",
+    "thumbs_up": "\U0001F44D",
+    "thumbs up": "\U0001F44D",
+    "ok": "\U0001F44C",
+    "wave": "\U0001F44B",
+    "eyes": "\U0001F440",
+    "rocket": "\U0001F680",
+    "star": "\u2B50",
+    "heart": "\u2764\uFE0F",
+    "fire": "\U0001F525",
+    "100": "\U0001F4AF",
+    "clap": "\U0001F44F",
+    "pray": "\U0001F64F",
+    "salute": "\U0001FAE1",
+}
+
+
+def _parse_reaction(reaction_text: str) -> str:
+    """Convert reaction text to actual emoji."""
+    if not reaction_text:
+        return "\u2705"  # Default: checkmark
+
+    text = reaction_text.lower().strip()
+
+    # If it's already an emoji, return it
+    if len(text) <= 2 or text.startswith(":"):
+        # Check if it's a Discord-style :emoji: format
+        if text.startswith(":") and text.endswith(":"):
+            text = text[1:-1]
+
+    return REACTION_EMOJI_MAP.get(text, "\u2705")
 
 
 # Structured output schema for chime-in decisions (Gemini)
@@ -13,7 +51,7 @@ CHIME_IN_DECISION_SCHEMA = {
     "properties": {
         "decision": {
             "type": "STRING",
-            "enum": ["RESPOND", "STAY_QUIET", "NOT_RELEVANT"],
+            "enum": ["RESPOND", "ACKNOWLEDGE_ONLY", "STAY_QUIET", "NOT_RELEVANT"],
             "description": "Whether to chime in on this message"
         },
         "confidence": {
@@ -23,6 +61,10 @@ CHIME_IN_DECISION_SCHEMA = {
         "reasoning": {
             "type": "STRING",
             "description": "Brief explanation for the decision"
+        },
+        "reaction": {
+            "type": "STRING",
+            "description": "Emoji reaction for ACKNOWLEDGE_ONLY (e.g., 'checkmark', 'thumbsup')"
         }
     },
     "required": ["decision", "confidence", "reasoning"]
@@ -31,7 +73,8 @@ CHIME_IN_DECISION_SCHEMA = {
 
 class ChimeInDecision(Enum):
     """Decision about whether to chime in on a conversation."""
-    RESPOND = "respond"        # Agent should respond
+    RESPOND = "respond"        # Agent should respond with full message
+    ACKNOWLEDGE_ONLY = "acknowledge"  # Just react with emoji, no text needed
     STAY_QUIET = "stay_quiet"  # Agent decided not to respond
     NOT_RELEVANT = "not_relevant"  # Not relevant to this agent's domain
 
@@ -74,46 +117,58 @@ class ChimeInResult:
     response: Optional[str] = None
     reasoning: Optional[str] = None
     confidence: float = 0.5  # 0.0 to 1.0
+    suggested_reaction: Optional[str] = None  # Emoji for ACKNOWLEDGE_ONLY
 
     @property
     def should_respond(self) -> bool:
         """Whether the agent should respond based on this result."""
         return self.decision == ChimeInDecision.RESPOND
 
+    @property
+    def should_acknowledge(self) -> bool:
+        """Whether the agent should just add a reaction."""
+        return self.decision == ChimeInDecision.ACKNOWLEDGE_ONLY
+
 
 # Evaluation prompt template for chime-in decisions (utility LLM - decision only)
-CHIME_IN_EVALUATION_PROMPT = """INTERNAL DECISION PROCESS - DO NOT RESPOND TO THE USER
+CHIME_IN_EVALUATION_PROMPT = """INTERNAL DECISION PROCESS
 
-You are the decision module for {agent_name}. Output a decision about whether to chime in.
+You are the decision module for {agent_name}.
 
 === INPUT ===
 Message: "{message}"
 From: {author}
 Your domain: {agent_description}
+Mentioned agents: {mentioned_agents}
 Recent conversation:
 {recent_context}
 Memories: {memory_context}
 
-=== MANDATORY RESPOND (ignore domain, these ALWAYS trigger RESPOND) ===
-- Words like "everyone", "all of you", "please respond", "say hi" → RESPOND
-- Your name mentioned (even without @) → RESPOND
-- Direct question to the group → RESPOND
+=== CRITICAL MENTION RULES (check FIRST) ===
+- If mentioned_agents is NOT empty AND you are NOT in the list → STAY_QUIET (message is for someone else)
+- If mentioned_agents IS empty → Evaluate based on content relevance
+- If you ARE in mentioned_agents → Evaluate whether RESPOND or ACKNOWLEDGE_ONLY is appropriate
 
-=== STAY_QUIET only when ===
-- None of the mandatory triggers above apply AND
-- Topic is completely unrelated to you AND
-- Someone else already fully handled it
+=== DECISION OPTIONS ===
+- RESPOND: You need to take action or provide substantial information
+- ACKNOWLEDGE_ONLY: Just react with emoji (for FYI messages, handoff completions, status updates where no action needed)
+- STAY_QUIET: Not relevant to you OR already handled OR message is for someone else
+
+=== RESPOND triggers (only if you pass mention rules) ===
+- Words like "everyone", "all of you" addressing the group
+- Your name mentioned and action/response is expected
+- Direct question requiring your expertise
+
+=== ACKNOWLEDGE_ONLY triggers ===
+- You are mentioned but it's just an FYI or status update
+- Handoff completion ("@Agent, done with X")
+- No action or response is actually needed from you
 
 === OUTPUT FORMAT ===
-DECISION: RESPOND
+DECISION: RESPOND | ACKNOWLEDGE_ONLY | STAY_QUIET
 CONFIDENCE: 0.9
-REASONING: [reason]
-
-OR
-
-DECISION: STAY_QUIET
-CONFIDENCE: 0.9
-REASONING: [reason]
+REASONING: [brief reason]
+REACTION: [emoji, only for ACKNOWLEDGE_ONLY, e.g. "checkmark" or "thumbsup"]
 """
 
 
@@ -141,6 +196,8 @@ def parse_chime_in_response(response_text: str) -> ChimeInResult:
             decision_str = data["decision"].upper()
             if decision_str == "RESPOND":
                 decision = ChimeInDecision.RESPOND
+            elif decision_str == "ACKNOWLEDGE_ONLY":
+                decision = ChimeInDecision.ACKNOWLEDGE_ONLY
             elif decision_str == "NOT_RELEVANT":
                 decision = ChimeInDecision.NOT_RELEVANT
             else:
@@ -150,6 +207,7 @@ def parse_chime_in_response(response_text: str) -> ChimeInResult:
                 decision=decision,
                 confidence=float(data.get("confidence", 0.5)),
                 reasoning=data.get("reasoning", ""),
+                suggested_reaction=_parse_reaction(data.get("reaction", "")),
             )
     except (json.JSONDecodeError, TypeError, ValueError):
         pass  # Not JSON, try text format
@@ -161,6 +219,7 @@ def parse_chime_in_response(response_text: str) -> ChimeInResult:
     decision = None
     confidence = 0.5
     reasoning = None
+    reaction = None
     found_structured_format = False
 
     for line in lines:
@@ -168,8 +227,12 @@ def parse_chime_in_response(response_text: str) -> ChimeInResult:
         if line.startswith("DECISION:"):
             found_structured_format = True
             decision_str = line.replace("DECISION:", "").strip().upper()
+            # Handle "RESPOND | ACKNOWLEDGE_ONLY | STAY_QUIET" format
+            decision_str = decision_str.split("|")[0].strip()
             if decision_str == "RESPOND":
                 decision = ChimeInDecision.RESPOND
+            elif decision_str == "ACKNOWLEDGE_ONLY":
+                decision = ChimeInDecision.ACKNOWLEDGE_ONLY
             elif decision_str == "NOT_RELEVANT":
                 decision = ChimeInDecision.NOT_RELEVANT
             else:
@@ -185,11 +248,15 @@ def parse_chime_in_response(response_text: str) -> ChimeInResult:
         elif line.startswith("REASONING:"):
             reasoning = line.replace("REASONING:", "").strip()
 
+        elif line.startswith("REACTION:"):
+            reaction = line.replace("REACTION:", "").strip()
+
     if found_structured_format and decision is not None:
         return ChimeInResult(
             decision=decision,
             confidence=confidence,
             reasoning=reasoning,
+            suggested_reaction=_parse_reaction(reaction) if reaction else None,
         )
 
     # Natural language fallback - default to STAY_QUIET
@@ -217,11 +284,29 @@ def parse_chime_in_response(response_text: str) -> ChimeInResult:
     )
 
 
+def clean_mention_tokens(content: str, agent_registry: Dict[str, int]) -> str:
+    """
+    Replace Discord mention tokens with readable @AgentName format.
+
+    Args:
+        content: Message content with raw <@123456789> tokens
+        agent_registry: Dict mapping agent names to their Discord user IDs
+
+    Returns:
+        Content with mentions replaced by @AgentName
+    """
+    for name, user_id in agent_registry.items():
+        content = content.replace(f"<@{user_id}>", f"@{name.capitalize()}")
+        content = content.replace(f"<@!{user_id}>", f"@{name.capitalize()}")
+    return content
+
+
 def build_evaluation_prompt(
     agent_name: str,
     agent_description: str,
     context: ChimeInContext,
     memory_context: str = "",
+    mentioned_agents: Optional[List[str]] = None,
 ) -> str:
     """
     Build the evaluation prompt for chime-in decision.
@@ -231,6 +316,7 @@ def build_evaluation_prompt(
         agent_description: Description of agent's domain/personality
         context: ChimeInContext with message details
         memory_context: Relevant memories about chime-in preferences
+        mentioned_agents: List of agent names that were @mentioned in the message
 
     Returns:
         Formatted prompt string
@@ -239,6 +325,12 @@ def build_evaluation_prompt(
         f"  - {msg}" for msg in context.recent_messages[-10:]
     ) if context.recent_messages else "(no recent context)"
 
+    # Format mentioned agents for the prompt
+    if mentioned_agents:
+        mentioned_str = ", ".join(f"@{name}" for name in mentioned_agents)
+    else:
+        mentioned_str = "(none - message is to the general channel)"
+
     return CHIME_IN_EVALUATION_PROMPT.format(
         agent_name=agent_name,
         message=context.message_content,
@@ -246,4 +338,5 @@ def build_evaluation_prompt(
         recent_context=recent_context,
         memory_context=memory_context or "(no relevant memories)",
         agent_description=agent_description,
+        mentioned_agents=mentioned_str,
     )

@@ -78,6 +78,14 @@ SESSION MANAGEMENT:
 - Use switch_session to manage multiple concurrent sessions
 - Each project can have its own session with Claude Code running
 
+SESSION NOTES (IMPORTANT):
+- Use set_session_note to annotate what each session is for
+- Use get_session_note to check a session's purpose
+- list_active_sessions shows all sessions with their notes
+- ALWAYS set a note when creating a session (e.g., "Building React dashboard for Hyperion")
+- BEFORE creating a new session, check list_active_sessions to see if one already exists for your task
+- This prevents duplicate sessions for the same work
+
 IMPORTANT - DO NOT TERMINATE SESSIONS:
 - NEVER call terminate_session unless the USER explicitly asks you to close/terminate/delete a session
 - Sessions should persist so work can continue later
@@ -125,6 +133,24 @@ TASK CONTROL:
 - request_clarification: Use for quick yes/no questions while working
   - Example: "Should I also update the tests?"
 - DON'T just guess when you're unsure - ASK using these tools!
+
+FILESYSTEM NAVIGATION (read-only):
+- Use list_directory to explore folders (like ls)
+- Use read_file to examine code, configs, or docs
+- Use find_files to search for files by pattern (e.g., '*.py', 'src/**/*.tsx')
+- Use file_info for detailed info about a file/directory
+- These tools are READ-ONLY - they don't modify anything
+- For MODIFYING files, use Claude Code via a session - that's the proper workflow
+- Use navigation tools to understand project structure BEFORE delegating to Claude Code
+
+TUNNEL MANAGEMENT (ngrok):
+- When you start a dev server (e.g., npm run dev on port 3000), use start_tunnel to expose it
+- The user may be REMOTE and can't access localhost - tunnels give them a public URL
+- start_tunnel(port=3000) returns a public URL like https://abc123.ngrok.io
+- Always share the tunnel URL with the user when you start a dev server
+- Use stop_tunnel when the server is no longer needed
+- Use list_tunnels to see all active tunnels
+- PROACTIVELY create tunnels when starting any web server, preview, or dev environment
 
 COMMUNICATION STYLE:
 - Be direct and to the point
@@ -327,6 +353,8 @@ class AltairAgent(BaseAgent):
             TerminateSessionTool,
             SwitchSessionTool,
             ListProjectsTool,
+            SetSessionNoteTool,
+            GetSessionNoteTool,
         )
         from altair.tools.monitoring import (
             MonitorSessionTool,
@@ -337,6 +365,18 @@ class AltairAgent(BaseAgent):
             AbortTaskTool,
             RequestClarificationTool,
         )
+        from altair.tools.tunnel import (
+            StartTunnelTool,
+            StopTunnelTool,
+            ListTunnelsTool,
+        )
+        from altair.tools.navigation import (
+            ListDirectoryTool,
+            GetCurrentDirectoryTool,
+            ReadFileTool,
+            FindFilesTool,
+            FileInfoTool,
+        )
         from shared.memory.tools import get_memory_tools
 
         # Session management tools
@@ -344,6 +384,8 @@ class AltairAgent(BaseAgent):
         self._tools.register(TerminateSessionTool())
         self._tools.register(SwitchSessionTool())
         self._tools.register(ListProjectsTool())
+        self._tools.register(SetSessionNoteTool())
+        self._tools.register(GetSessionNoteTool())
 
         # CLI tools
         self._tools.register(StartClaudeCodeTool())
@@ -361,6 +403,18 @@ class AltairAgent(BaseAgent):
         # Task control tools (abort, clarification)
         self._tools.register(AbortTaskTool())
         self._tools.register(RequestClarificationTool())
+
+        # Tunnel tools (ngrok for exposing dev servers remotely)
+        self._tools.register(StartTunnelTool())
+        self._tools.register(StopTunnelTool())
+        self._tools.register(ListTunnelsTool())
+
+        # Navigation tools (read-only filesystem exploration)
+        self._tools.register(ListDirectoryTool())
+        self._tools.register(GetCurrentDirectoryTool())
+        self._tools.register(ReadFileTool())
+        self._tools.register(FindFilesTool())
+        self._tools.register(FileInfoTool())
 
         # Inter-agent communication tool (for delegating tasks)
         if self.discord_bot and self.agent_registry:

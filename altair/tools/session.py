@@ -1,9 +1,12 @@
 """Session management tools for Altair."""
 
 from typing import Optional, List
+import logging
 
 from shared.llm.types import ToolParameter
 from shared.tools.interface import Tool, ToolContext
+
+logger = logging.getLogger(__name__)
 
 
 class CreateSessionTool(Tool):
@@ -254,6 +257,101 @@ class SwitchSessionTool(Tool):
         status = "running" if session.is_alive else "stopped"
         channel_info = f"<#{session.channel_id}>" if session.channel_id else "unknown"
         return f"Switched to session #{session_id} [{status}] in {channel_info}."
+
+
+class SetSessionNoteTool(Tool):
+    """Set notes for a session to remember what it's for."""
+
+    @property
+    def name(self) -> str:
+        return "set_session_note"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Set a note for a session to remember what it's being used for. "
+            "Use this to track which session is for which task, project, or purpose. "
+            "This helps you avoid creating duplicate sessions for the same work."
+        )
+
+    @property
+    def parameters(self) -> List[ToolParameter]:
+        return [
+            ToolParameter(
+                name="note",
+                type="string",
+                description="The note describing what this session is for (e.g., 'Building React dashboard for Project X')",
+                required=True,
+            ),
+            ToolParameter(
+                name="session_id",
+                type="integer",
+                description="Session ID to annotate. Uses current session if not specified.",
+                required=False,
+            ),
+        ]
+
+    async def execute(
+        self,
+        context: ToolContext,
+        note: str,
+        session_id: Optional[int] = None,
+    ) -> str:
+        sid = session_id or context.current_session_id
+        if not sid:
+            return "Error: No session ID provided and no current session."
+
+        session = await context.session_registry.get_session(sid)
+        if not session:
+            return f"Error: Session #{sid} not found."
+
+        # Update the note in session data
+        await context.session_registry.store.update(sid, notes=note)
+        session.data.notes = note
+
+        return f"✅ Note set for session #{sid}: {note}"
+
+
+class GetSessionNoteTool(Tool):
+    """Get the note for a session."""
+
+    @property
+    def name(self) -> str:
+        return "get_session_note"
+
+    @property
+    def description(self) -> str:
+        return "Get the note for a session to see what it's being used for."
+
+    @property
+    def parameters(self) -> List[ToolParameter]:
+        return [
+            ToolParameter(
+                name="session_id",
+                type="integer",
+                description="Session ID to get note for. Uses current session if not specified.",
+                required=False,
+            ),
+        ]
+
+    async def execute(
+        self,
+        context: ToolContext,
+        session_id: Optional[int] = None,
+    ) -> str:
+        sid = session_id or context.current_session_id
+        if not sid:
+            return "Error: No session ID provided and no current session."
+
+        session = await context.session_registry.get_session(sid)
+        if not session:
+            return f"Error: Session #{sid} not found."
+
+        note = session.data.notes
+        if note:
+            return f"Session #{sid} note: {note}"
+        else:
+            return f"Session #{sid} has no note set."
 
 
 class ListProjectsTool(Tool):

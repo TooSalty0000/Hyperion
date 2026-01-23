@@ -508,8 +508,9 @@ class ListActiveSessionsTool(Tool):
             for session in sessions:
                 status = "Running" if session.is_alive else "Stopped"
                 channel_ref = f"<#{session.channel_id}>" if session.channel_id else "(no channel)"
+                note_str = f"\n  📝 {session.data.notes}" if session.data.notes else ""
                 lines.append(
-                    f"- Session #{session.session_id}: [{status}] {channel_ref} (PID: {session.data.pid})"
+                    f"- Session #{session.session_id}: [{status}] {channel_ref} (PID: {session.data.pid}){note_str}"
                 )
 
             return '\n'.join(lines)

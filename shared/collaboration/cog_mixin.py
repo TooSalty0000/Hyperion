@@ -13,6 +13,10 @@ from shared.collaboration.evaluator import (
     ChimeInDecision,
     ChimeInResult,
 )
+from shared.collaboration.suppression import (
+    SuppressionManager,
+    parse_suppression_command,
+)
 from shared.base_agent import AgentContext
 from shared.tools.stay_quiet import check_quiet_preferences
 
@@ -81,6 +85,17 @@ class CollaborativeCogMixin:
 
         # Never chime-in to own messages
         if message.author == self.bot.user:
+            return False
+
+        # Check session-level suppression (e.g., user said "stop testing")
+        suppression = SuppressionManager.get_instance().is_suppressed(
+            agent_name=self.agent.name,
+            channel_id=message.channel.id,
+        )
+        if suppression:
+            logger.debug(
+                f"[{self.agent.name}] Skipping chime-in - suppressed: {suppression.reason}"
+            )
             return False
 
         # Early exit: Check cooldown FIRST before any delays
@@ -208,6 +223,17 @@ class CollaborativeCogMixin:
                 except Exception as e:
                     logger.error(f"[{self.agent.name}] Chime-in processing error: {e}", exc_info=True)
 
+            elif result.decision == ChimeInDecision.ACKNOWLEDGE_ONLY:
+                # Just add a reaction, no text response needed
+                reaction = result.suggested_reaction or "\u2705"  # Default: checkmark
+                try:
+                    await message.add_reaction(reaction)
+                    self._last_chime_in_time = datetime.now()
+                    logger.info(f"[{self.agent.name}] Acknowledged with reaction: {reaction}")
+                    return True
+                except discord.HTTPException as e:
+                    logger.warning(f"[{self.agent.name}] Failed to add reaction: {e}")
+
             return False
         finally:
             # Always clear the flag when done
@@ -321,6 +347,76 @@ class CollaborativeCogMixin:
 
         # Use the cached memory context from the agent
         return self.agent.get_cached_memory_context()
+
+    async def check_and_handle_suppression_command(
+        self,
+        message: discord.Message,
+    ) -> bool:
+        """
+        Check if a message contains a suppression command and handle it.
+
+        This should be called early in message processing to detect commands
+        like "@Canopus stop testing" or "everyone stand down".
+
+        Args:
+            message: The Discord message to check
+
+        Returns:
+            True if a suppression command was handled (caller may want to skip further processing)
+        """
+        if not hasattr(self, '_agent_registry') or not self._agent_registry:
+            return False
+
+        parsed = parse_suppression_command(message.content, self._agent_registry)
+        if not parsed:
+            return False
+
+        suppression_mgr = SuppressionManager.get_instance()
+
+        if parsed["action"] == "suppress":
+            target_agent = parsed["agent"]
+
+            # Check if this suppression is directed at this agent (or everyone)
+            if target_agent == "*" or target_agent == self.agent.name.lower():
+                suppression_mgr.add_suppression(
+                    agent_name=target_agent,
+                    reason=f"User requested: {message.content[:50]}",
+                    duration_seconds=parsed.get("duration", 600),
+                    channel_id=message.channel.id,
+                    activity_pattern=parsed.get("activity"),
+                )
+
+                # Only acknowledge if this agent is specifically targeted
+                if target_agent == self.agent.name.lower():
+                    try:
+                        await message.add_reaction("\U0001F64A")  # speak-no-evil monkey
+                    except discord.HTTPException:
+                        pass
+
+                logger.info(
+                    f"[{self.agent.name}] Suppression activated by user command: {message.content[:50]}"
+                )
+                return True
+
+        elif parsed["action"] == "resume":
+            target_agent = parsed["agent"]
+
+            if target_agent == self.agent.name.lower():
+                cleared = suppression_mgr.clear_suppression(
+                    agent_name=target_agent,
+                    channel_id=message.channel.id,
+                )
+
+                if cleared:
+                    try:
+                        await message.add_reaction("\U0001F44B")  # wave
+                    except discord.HTTPException:
+                        pass
+
+                    logger.info(f"[{self.agent.name}] Suppression cleared by user command")
+                return True
+
+        return False
 
     async def handle_event_notification(
         self,

@@ -202,12 +202,13 @@ class BaseAgent(ABC):
             parse_chime_in_response,
         )
 
-        # Build evaluation prompt
+        # Build evaluation prompt with mentioned agents for proper mention handling
         prompt = build_evaluation_prompt(
             agent_name=self.name,
             agent_description=self.chime_in_description,
             context=context,
             memory_context=memory_context,
+            mentioned_agents=context.mentioned_agents,
         )
 
         try:
