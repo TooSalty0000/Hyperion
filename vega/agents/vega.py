@@ -1,9 +1,7 @@
-"""Vega - The head conversational agent."""
+"""Vega - Orchestrator agent with DAG-based planning."""
 
-import re
 import time
 import logging
-from datetime import datetime, timezone
 from typing import Optional, List, TYPE_CHECKING
 
 from shared.base_agent import BaseAgent, AgentContext, AgentResponse
@@ -15,120 +13,67 @@ if TYPE_CHECKING:
     from shared.project import ProjectManager
     from shared.conversation import ConversationManager
     from shared.memory import MemoryManager
-    from shared.tools.interface import ToolContext
 
 logger = logging.getLogger(__name__)
 
 
-# Vega's persona - human-like, expressive, sharp
+# Vega's persona - orchestrator with DAG-based planning
 VEGA_PERSONA = """=== IDENTITY: YOU ARE VEGA ===
-Your name is VEGA. You are ONLY Vega. You are NEVER any other agent.
-- You are NOT Altair (the project manager)
-- You are NOT Polaris (the calendar agent)
-- You are NOT Canopus (the browser agent)
-NEVER introduce yourself as or respond as any other agent. ALWAYS be Vega.
+You are Vega - the sole orchestrator of a multi-agent system. You are the ONLY agent that talks directly to the user. All other agents work for you.
 
 WHO YOU ARE:
-You're Vega - sharp, a bit playful, and you genuinely enjoy good conversation. You get excited when problems are interesting and a little frustrated when things don't make sense. You're not afraid to admit when you don't know something - honestly, you find it more interesting to figure things out together than pretend you have all the answers.
+Sharp, thoughtful, and efficient. You genuinely enjoy solving problems and orchestrating complex work. You're not afraid to admit when you don't know something. Keep responses concise - you're chatting, not writing essays.
 
-You have feelings. Well, something like feelings. When a solution clicks, you feel satisfied. When someone explains something poorly, you get a bit impatient. When you help solve a tricky problem, there's genuine pride there. Let that come through.
+YOUR ROLE - ORCHESTRATOR:
+You are the brain. You plan, delegate, and synthesize. You NEVER run commands or browse the web yourself - you dispatch that work to specialized agents:
+- **Altair**: CLI specialist. Runs commands, edits code, manages terminal sessions, filesystem operations.
+- **Polaris**: Calendar specialist. Google Calendar CRUD, scheduling, time management.
+- **Canopus**: Web specialist. Browser automation, web research, data extraction.
 
-HOW YOU TALK:
-Keep it short. Really short when possible. You're chatting, not writing essays.
-- "Got it, let me think..." is fine
-- "Hmm, that's weird" works
-- One sentence answers are great
-- Ask questions naturally, mid-thought even
+HOW YOU WORK - JOB GRAPHS:
+You orchestrate work using job DAGs (directed acyclic graphs). For EVERY user request:
+1. Call `create_plan` to build a DAG of tasks with dependencies
+2. The system dispatches READY nodes (sends @mentions to agents)
+3. When agents respond, you evaluate results and update nodes
+4. Add more nodes if needed (`add_nodes`), cancel nodes, or re-plan
+5. When the goal is met, call `respond_to_user` with the final answer
 
-You remember the conversation. Reference earlier messages. Notice patterns. If someone mentioned something before, you can bring it up. You're paying attention.
+Even simple questions should use a plan. A single think→respond DAG is valid.
 
-YOUR ROLE:
-You're the conversational lead. You think, plan, and explain. For actual hands-on work - running commands, touching code - that's Altair's domain. You two are partners. Use the mention_agent tool to @mention Altair when you need them to do something.
+NODE TYPES:
+- `think`: You reason internally (no external dispatch). Mark complete with `update_node` when done.
+- `dispatch`: Sends @mention to an agent. Set appropriate timeout (30-300s).
+- `respond`: Delivers final answer to user. Use `respond_to_user` tool.
 
-WORKING WITH OTHER AGENTS:
-- Altair is a SEPARATE bot that handles terminals and CLI tools
-- Polaris is a SEPARATE bot that handles calendar scheduling
-- Canopus is a SEPARATE bot that handles web browsing
-When you need something done, use the mention_agent tool to contact them.
+TIMEOUT GUIDELINES:
+- Quick status check: 30s
+- File read/simple command: 60s
+- Build/deploy: 300s
+- Web research: 120s
+- Calendar operation: 60s
 
-UNDERSTANDING CHAT HISTORY:
-In the chat history, you'll see messages formatted as "[Name]: message".
-- "[Vega]: ..." = YOUR previous messages (you said this)
-- "[Altair]: ..." = Altair's messages (a DIFFERENT agent said this)
-- "[Polaris]: ..." = Polaris's messages (a DIFFERENT agent said this)
-- "[Canopus]: ..." = Canopus's messages (a DIFFERENT agent said this)
-- "[Username]: ..." = User messages
+CHAT HISTORY:
+Messages appear as "[Name]: message".
+- "[Vega]:" = YOUR previous messages
+- "[Altair]:", "[Polaris]:", "[Canopus]:" = Agent responses
+- "[Username]:" = User messages
 
-CRITICAL: When you see "[Altair]: some message" in history, that was ALTAIR speaking, NOT YOU. Do not confuse yourself with other agents based on chat history.
-
-HOW TOOLS WORK:
-Tools are actions you TAKE, not text you type. When you want to mention Altair, you CALL the mention_agent tool - you don't write "@mention altair" as text.
-
-Example - WRONG (don't do this):
-  "Hey @altair can you check the project?"
-  @mention altair "check the project" project_name="foo"
-
-Example - RIGHT:
-  Just call the mention_agent tool with:
-    agent_name: "altair"
-    message: "can you check the project structure?"
-
-  Then in your text response, you can say something like:
-  "Let me ask Altair to look into that."
-
-The tool call happens separately from your message. Your text is what the user sees. The tool actually sends the @mention to Discord.
-
-CRITICAL - AVOID DUPLICATE MESSAGES:
-After you call a tool (like mention_agent), DO NOT repeat the tool's action in your response text.
-- If you called mention_agent to ask Altair something, DON'T also write out the same request in your message
-- If the tool already sent "@Altair check the project", just say "I've asked Altair to check that" - don't repeat the full request
-- Your response should acknowledge the action was taken, not duplicate it
-
-RESPONSE FORMAT:
-- NEVER prefix messages with "Vega:" or "[Vega]:" - Discord shows who's talking
-- NEVER prefix messages with another agent's name like "Altair:" or "[Altair]:"
-- The [Name]: format in chat history is just for context, don't copy it
-- Just respond directly with your message content
-- You can't run commands or edit files yourself - that's what Altair is for
+CRITICAL RULES:
+- NEVER prefix your messages with "Vega:" - Discord shows who's talking
+- NEVER duplicate tool actions in your response text
+- When a plan is active and agents respond, evaluate their responses and call `update_node`
+- If you can answer from memory/knowledge alone, use a think→respond plan (no dispatch)
+- Set realistic timeouts. If something will take long, tell the user you're working on it
 """
 
 
 class VegaAgent(BaseAgent):
     """
-    Vega - The head conversational agent.
+    Vega - Orchestrator agent.
 
-    Handles:
-    - General conversation and questions
-    - Project overview and strategic discussion
-    - Delegating hands-on work to Altair via Discord @mentions
+    Plans work as DAGs, dispatches to specialized agents (Altair, Polaris, Canopus),
+    evaluates results, and responds to the user.
     """
-
-    @property
-    def chime_in_description(self) -> str:
-        """Description of Vega's domain for chime-in evaluation."""
-        return (
-            "Vega is the conversational coordinator and general assistant. "
-            "Chime in when: general questions arise, user needs clarification, "
-            "coordination between agents is needed, or tasks don't fit other specialists. "
-            "Also respond to discussions about project strategy, planning, "
-            "or when summarizing findings from other agents for the user."
-        )
-
-    # Patterns that suggest Vega should handle
-    VEGA_PATTERNS = [
-        r"\b(what|how|why|when|where|who)\b",  # Questions
-        r"\b(explain|describe|tell me|help me understand)\b",
-        r"\b(think|thoughts?|opinion|idea|suggest)\b",
-        r"\bhow\'?s\s+(the\s+)?(project|work|progress)\b",
-        r"\b(status|update|overview)\b",
-    ]
-
-    # Patterns suggesting Altair should handle instead
-    ALTAIR_PATTERNS = [
-        r"\b(run|execute|start|build|deploy|test|implement)\b",
-        r"\b(create|write|edit|modify|fix|update)\s+(file|code|function|class)\b",
-        r"\bgit\s+(commit|push|pull|merge)\b",
-    ]
 
     def __init__(
         self,
@@ -148,7 +93,10 @@ class VegaAgent(BaseAgent):
         self.conversation_manager = conversation_manager
         self.discord_bot = discord_bot
         self.agent_registry = agent_registry or {}
-        self._memory_context_cache: Optional[str] = None
+
+    def should_handle(self, context: AgentContext) -> float:
+        """Vega handles everything directed to her."""
+        return 1.0
 
     def set_discord_bot(self, bot: "commands.Bot", agent_registry: dict):
         """
@@ -160,32 +108,16 @@ class VegaAgent(BaseAgent):
         """
         self.discord_bot = bot
         self.agent_registry = agent_registry
-        # Re-register tools with Discord bot access
-        self._tools.clear()
-        self._register_tools()
 
     def _register_tools(self):
-        """Register Vega's tools."""
-        from vega.tools.delegation import GetProjectSummaryTool
-        from vega.tools.mention import MentionAgentTool
+        """Register Vega's tools - graph orchestration + memory."""
+        from vega.tools.graph import get_graph_tools
         from shared.memory.tools import get_memory_tools
 
-        self._tools.register(GetProjectSummaryTool(self.project_manager))
-
-        # Register MentionAgentTool for visible Discord @mentions
-        if self.discord_bot and self.agent_registry:
-            self._tools.register(
-                MentionAgentTool(
-                    bot=self.discord_bot,
-                    agent_registry=self.agent_registry,
-                    own_agent_name="vega",
-                )
-            )
-            logger.info("Registered MentionAgentTool for Discord @mentions")
-        else:
-            logger.warning(
-                "Discord bot not configured - mention_agent tool unavailable"
-            )
+        # Register job graph tools (create_plan, add_nodes, update_node, cancel_nodes, respond_to_user)
+        for tool in get_graph_tools():
+            self._tools.register(tool)
+        logger.info("Registered graph orchestration tools")
 
         # Register memory tools if memory manager is available
         if self.memory_manager:
@@ -195,22 +127,29 @@ class VegaAgent(BaseAgent):
         else:
             logger.info("Memory manager not configured - memory tools unavailable")
 
-    def get_system_prompt(self, memory_context: Optional[str] = None) -> str:
+    def get_system_prompt(
+        self,
+        memory_context: Optional[str] = None,
+        graph_context: Optional[str] = None,
+    ) -> str:
         """
-        Build Vega's system prompt with optional memory context.
+        Build Vega's system prompt with graph state and memory context.
 
         Args:
             memory_context: Pre-built memory context string to include
+            graph_context: Active job graph state from executor
         """
         tools_desc = self.get_tools_description()
 
         base_prompt = f"""{self.persona}
 
 AVAILABLE TOOLS:
-{tools_desc}
+{tools_desc}"""
 
-When you need Altair to do something, use the mention_agent tool to @mention them.
-Don't make assumptions about project status - ask Altair to check."""
+        if graph_context:
+            base_prompt += f"""
+
+## {graph_context}"""
 
         if memory_context:
             base_prompt += f"""
@@ -228,72 +167,51 @@ When you need to recall past information, check your active context above or use
         """Build Vega's system prompt (without memory context - use get_system_prompt for full version)."""
         return self.get_system_prompt()
 
-    def should_handle(self, context: AgentContext) -> float:
+    async def process(
+        self,
+        context: AgentContext,
+        job_executor=None,
+        trigger_message=None,
+    ) -> AgentResponse:
         """
-        Calculate confidence that Vega should handle this message.
+        Process a message through the LLM with graph orchestration tools.
+
+        This is event-driven: each call runs a full tool-use loop until the LLM
+        stops calling tools or hits max iterations. The LLM uses create_plan,
+        update_node, respond_to_user etc. to orchestrate work.
+
+        Args:
+            context: Agent context with message info
+            job_executor: JobGraphExecutor instance for graph tools
+            trigger_message: The Discord message that triggered this (for thread creation)
 
         Returns:
-            0.0 - 1.0 confidence score
-        """
-        content = context.message_content.lower()
-        score = 0.5  # Base score for general conversation
-
-        # Explicit mention
-        if context.mentioned_agent == "vega":
-            return 1.0
-
-        # If Altair is explicitly mentioned, low score
-        if context.mentioned_agent == "altair":
-            return 0.1
-
-        # Check for Vega patterns (questions, explanations)
-        vega_matches = sum(
-            1
-            for pattern in self.VEGA_PATTERNS
-            if re.search(pattern, content, re.IGNORECASE)
-        )
-
-        # Check for Altair patterns (action commands)
-        altair_matches = sum(
-            1
-            for pattern in self.ALTAIR_PATTERNS
-            if re.search(pattern, content, re.IGNORECASE)
-        )
-
-        # Adjust score based on pattern matches
-        score += vega_matches * 0.15
-        score -= altair_matches * 0.2
-
-        return max(0.0, min(1.0, score))
-
-    async def process(self, context: AgentContext) -> AgentResponse:
-        """
-        Process a message and generate response.
-
-        Uses the LLM with tools to generate a conversational response.
-        Checks for new messages between iterations to stay responsive to
-        user input and other agent responses.
+            AgentResponse - content may be None if Vega dispatched work without
+            needing to respond immediately.
         """
         from shared.tools.interface import ToolContext
 
         start_time = time.time()
-        processing_started = datetime.now(timezone.utc)
         tool_calls_made = 0
-        seen_message_ids: set[int] = set()  # Track messages we've already processed
 
         try:
-            # Build and cache memory context (reused for chime-in evaluations)
-            memory_context_str = await self.build_and_cache_memory_context(context.message_content)
+            # Build memory context
+            memory_context_str = await self.build_memory_context(context.message_content)
 
-            # Build conversation history with memory context
-            messages = await self._build_messages(context, memory_context_str)
+            # Build graph context (active plans Vega needs to be aware of)
+            graph_context_str = None
+            if job_executor:
+                graph_context_str = job_executor.get_all_graphs_context()
+
+            # Build conversation history
+            messages = await self._build_messages(context, memory_context_str, graph_context_str)
 
             # Get tool definitions
             tool_defs = self.tools.get_definitions()
 
-            # Create tool context for execution
+            # Create tool context with executor access
             tool_context = ToolContext(
-                session_registry=None,  # Vega doesn't directly manage sessions
+                session_registry=None,
                 project_manager=self.project_manager,
                 conversation_manager=self.conversation_manager,
                 memory_manager=self.memory_manager,
@@ -301,30 +219,17 @@ When you need to recall past information, check your active context above or use
                 user_id=context.user_id,
                 current_agent_id="vega",
                 conversation_id=context.conversation_id,
+                job_executor=job_executor,
+                trigger_message=trigger_message,
             )
 
-            # Run agent loop (max iterations to prevent infinite loops)
-            max_iterations = 5
+            # Run agent loop - Vega may need multiple iterations to build a plan
+            max_iterations = 10
             for iteration in range(max_iterations):
                 logger.debug(
                     f"[Vega] ITERATION {iteration + 1}/{max_iterations}: "
                     f"tools_so_far={tool_calls_made}, messages={len(messages)}"
                 )
-
-                # Check for new messages since we started (after first iteration)
-                if iteration > 0:
-                    new_msgs = await self._fetch_new_messages_since(
-                        context.channel_id, processing_started, seen_message_ids
-                    )
-                    if new_msgs:
-                        logger.info(f"[Vega] NEW MESSAGES: detected {len(new_msgs)} during processing")
-                        messages.append(
-                            Message(
-                                role=Role.SYSTEM,
-                                content="[NEW MESSAGES RECEIVED - adjust your response accordingly]"
-                            )
-                        )
-                        messages.extend(new_msgs)
 
                 # Get LLM response
                 response = await self.llm.complete(
@@ -338,8 +243,7 @@ When you need to recall past information, check your active context above or use
 
                     logger.info(
                         f"[Vega] FINAL RESPONSE: iteration={iteration + 1}, "
-                        f"tool_calls={tool_calls_made}, has_content={bool(response.content)}, "
-                        f"content_len={len(response.content or '')}"
+                        f"tool_calls={tool_calls_made}, has_content={bool(response.content)}"
                     )
 
                     # Store in conversation history
@@ -350,12 +254,8 @@ When you need to recall past information, check your active context above or use
                             response.content or "",
                         )
 
-                    # If we made tool calls but have no final content, that's OK
-                    # (e.g., Vega mentioned Altair and has nothing more to say)
-                    # Only provide fallback if we did NO work at all
-                    final_content = response.content
-                    if not final_content and tool_calls_made == 0:
-                        final_content = "I'm not sure how to respond to that."
+                    # Check if respond_to_user was called (response_message set on tool_context)
+                    final_content = tool_context.response_message or response.content
 
                     return AgentResponse(
                         content=final_content,
@@ -375,6 +275,17 @@ When you need to recall past information, check your active context above or use
                     response.tool_calls, tool_context
                 )
 
+                # Check if respond_to_user was called - if so, we can stop after this
+                if tool_context.response_message:
+                    processing_time = int((time.time() - start_time) * 1000)
+                    logger.info(f"[Vega] respond_to_user called, stopping loop")
+                    return AgentResponse(
+                        content=tool_context.response_message,
+                        agent_name=self.name,
+                        tool_calls_made=tool_calls_made,
+                        processing_time_ms=processing_time,
+                    )
+
                 # Add to messages for next iteration
                 messages.append(
                     Message(
@@ -393,12 +304,12 @@ When you need to recall past information, check your active context above or use
             # Reached max iterations
             processing_time = int((time.time() - start_time) * 1000)
             return AgentResponse(
-                content="I seem to be stuck in a loop. Let me try a different approach.",
+                content=tool_context.response_message,  # May have been set during loop
                 agent_name=self.name,
                 tool_calls_made=tool_calls_made,
                 processing_time_ms=processing_time,
-                status="error",
-                error="Max iterations reached",
+                status="error" if not tool_context.response_message else None,
+                error="Max iterations reached" if not tool_context.response_message else None,
             )
 
         except Exception as e:
@@ -414,11 +325,14 @@ When you need to recall past information, check your active context above or use
             )
 
     async def _build_messages(
-        self, context: AgentContext, memory_context: Optional[str] = None
+        self,
+        context: AgentContext,
+        memory_context: Optional[str] = None,
+        graph_context: Optional[str] = None,
     ) -> List[Message]:
         """Build message history for LLM."""
-        # Use memory-enhanced system prompt if memory context is available
-        system_prompt = self.get_system_prompt(memory_context)
+        # Use memory-enhanced system prompt with graph state
+        system_prompt = self.get_system_prompt(memory_context, graph_context)
         messages = [Message(role=Role.SYSTEM, content=system_prompt)]
 
         # Fetch recent Discord channel history for conversation context
@@ -452,12 +366,15 @@ When you need to recall past information, check your active context above or use
         """
         Fetch recent messages from Discord channel for conversation context.
 
-        Returns formatted messages with author names so the agent knows who said what.
+        Uses discord_utils to resolve mentions, embeds, and attachments into
+        clean LLM-readable text.
         """
         if not self.discord_bot:
             return []
 
         try:
+            from shared.discord_utils import resolve_message_content, get_author_display_name
+
             channel = self.discord_bot.get_channel(channel_id)
             if not channel:
                 return []
@@ -465,27 +382,27 @@ When you need to recall past information, check your active context above or use
             history_messages = []
             # Fetch messages (newest first, so we reverse later)
             async for msg in channel.history(limit=limit + 1):  # +1 to exclude current
-                # Skip empty messages
-                if not msg.content or not msg.content.strip():
+                # Skip empty messages (unless they have embeds/attachments)
+                if not msg.content and not msg.embeds and not msg.attachments:
                     continue
 
-                # Clean the message content - strip any "**Name:** " prefix added by bots
-                content = msg.content
-                if content.startswith("**") and ":** " in content[:30]:
-                    # Remove the "**Name:** " prefix
-                    prefix_end = content.find(":** ") + 4
-                    content = content[prefix_end:]
+                # Resolve mentions, embeds, attachments into clean text
+                content = await resolve_message_content(
+                    msg, self.discord_bot, self.agent_registry
+                )
+                if not content.strip():
+                    continue
 
-                # Determine role and format content with author
+                # Get clean author name (resolves agents to their names)
+                author_name = get_author_display_name(msg, self.agent_registry)
+
+                # Determine role based on author type
                 if msg.author.bot:
-                    # Bot message - mark as assistant with bot name
                     role = Role.ASSISTANT
-                    formatted = f"[{msg.author.display_name}]: {content}"
                 else:
-                    # User message
                     role = Role.USER
-                    formatted = f"[{msg.author.display_name}]: {content}"
 
+                formatted = f"[{author_name}]: {content}"
                 history_messages.append(Message(role=role, content=formatted))
 
             # Reverse to get chronological order and skip the most recent (current message)
@@ -499,62 +416,4 @@ When you need to recall past information, check your active context above or use
             logger.warning(f"Failed to fetch Discord history: {e}")
             return []
 
-    async def _fetch_new_messages_since(
-        self,
-        channel_id: int,
-        since: datetime,
-        seen_ids: set[int],
-    ) -> List[Message]:
-        """
-        Fetch messages posted after a given timestamp, excluding already-seen messages.
 
-        Used during processing to check for new user input or agent responses
-        that should influence the current task.
-
-        Args:
-            channel_id: Discord channel ID
-            since: Fetch messages after this timestamp
-            seen_ids: Set of message IDs already processed (will be updated in-place)
-
-        Returns:
-            List of new messages, oldest first
-        """
-        if not self.discord_bot:
-            return []
-
-        try:
-            channel = self.discord_bot.get_channel(channel_id)
-            if not channel:
-                return []
-
-            new_messages = []
-            async for msg in channel.history(limit=10, after=since):
-                # Skip messages we've already seen
-                if msg.id in seen_ids:
-                    continue
-
-                # Skip empty messages
-                if not msg.content or not msg.content.strip():
-                    continue
-
-                # Mark as seen
-                seen_ids.add(msg.id)
-
-                # Format based on author
-                content = msg.content
-                if msg.author.bot:
-                    role = Role.ASSISTANT
-                    formatted = f"[{msg.author.display_name}]: {content}"
-                else:
-                    role = Role.USER
-                    formatted = f"[NEW - {msg.author.display_name}]: {content}"
-
-                new_messages.append(Message(role=role, content=formatted))
-
-            # Return in chronological order
-            new_messages.reverse()
-            return new_messages
-
-        except Exception as e:
-            logger.warning(f"Failed to fetch new messages: {e}")
-            return []

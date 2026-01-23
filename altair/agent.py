@@ -532,8 +532,8 @@ When you need to recall past information, check your active context above or use
         seen_message_ids: set[int] = set()  # Track messages we've already processed
 
         try:
-            # Build and cache memory context (reused for chime-in evaluations)
-            memory_context_str = await self.build_and_cache_memory_context(context.message_content)
+            # Build memory context
+            memory_context_str = await self.build_memory_context(context.message_content)
 
             # Build conversation for LLM with memory context
             messages = await self._build_messages(context, memory_context_str)

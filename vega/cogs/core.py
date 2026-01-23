@@ -1,4 +1,4 @@
-"""Vega Core Cog - Conversational Discord bot functionality."""
+"""Vega Core Cog - Orchestrator with DAG-based planning."""
 
 import asyncio
 import logging
@@ -6,50 +6,52 @@ import os
 from typing import Optional
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from vega.config import Config
 from vega.agents import VegaAgent, AgentContext
 from shared.agent_queue import AgentMessageQueue
-from shared.collaboration import CollaborativeCogMixin
 from shared.agent_coordinator import (
     DistributedAgentTracker,
     AgentAcknowledgmentMixin,
-    REACTION_ACK,
-    REACTION_DONE,
 )
+from shared.discord_utils import is_from_known_agent
+from shared.job_graph.executor import JobGraphExecutor
 
 logger = logging.getLogger(__name__)
 
 
-class VegaCore(commands.Cog, CollaborativeCogMixin, AgentAcknowledgmentMixin):
+class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
     """
-    Vega Discord Bot - Head conversational agent.
+    Vega Discord Bot - Orchestrator agent.
 
-    Vega is a pure conversational agent. It handles natural language
-    conversation and delegates hands-on work to Altair via @mentions.
+    Vega is the sole agent that talks to the user. She plans work as DAGs,
+    dispatches tasks to specialized agents, evaluates responses, and delivers
+    final answers.
 
-    All commands (!vp, !vli, etc.) are handled by Altair.
-    Supports distributed agent tracking and acknowledgment via Discord reactions.
+    Routing:
+    - User messages → trigger new Vega process cycle (with executor context)
+    - Agent messages → matched to running graph nodes → trigger Vega re-evaluation
+    - Thread messages (planning threads) → ignored
+    - Timeout loop → checks for stuck nodes periodically
     """
 
     def __init__(self, bot):
         self.bot = bot
 
         # Agent components
-        self.vega_agent = None
+        self.vega_agent: Optional[VegaAgent] = None
         self.llm = None
         self.project_manager = None
         self.conversation_manager = None
         self.memory_manager = None
         self._agent_initialized = False
-        self._agent_registry = {}  # Maps agent names to Discord user IDs
+        self._agent_registry: dict[str, int] = {}
 
-        # Main channel for collaborative agent communication (uses AGENT_CHANNEL_ID)
-        self.main_channel_id = Config.AGENT_CHANNEL_ID if hasattr(Config, 'AGENT_CHANNEL_ID') else None
+        # Job graph executor - manages DAGs and dispatches work
+        self.executor: Optional[JobGraphExecutor] = None
 
         # Distributed tracker for inter-agent communication
-        # Each agent has its own tracker - no shared state
         self.tracker: Optional[DistributedAgentTracker] = None
 
         # Track message IDs we've acknowledged to avoid duplicate acks
@@ -69,7 +71,7 @@ class VegaCore(commands.Cog, CollaborativeCogMixin, AgentAcknowledgmentMixin):
 
     @property
     def agent(self):
-        """Get the agent instance (required by CollaborativeCogMixin)."""
+        """Get the agent instance."""
         return self.vega_agent
 
     def _load_agent_registry(self) -> dict:
@@ -92,7 +94,7 @@ class VegaCore(commands.Cog, CollaborativeCogMixin, AgentAcknowledgmentMixin):
         return registry
 
     def _init_agent(self):
-        """Initialize Vega agent."""
+        """Initialize Vega agent and executor."""
         if not Config.LLM_API_KEY:
             logger.info("LLM_API_KEY not configured, agent features disabled")
             return
@@ -111,12 +113,10 @@ class VegaCore(commands.Cog, CollaborativeCogMixin, AgentAcknowledgmentMixin):
             )
             logger.info(f"Initialized {Config.LLM_PROVIDER} LLM provider")
 
-            # Create utility LLM for cheap/fast evaluations (chime-in, etc.)
+            # Create utility LLM for cheap/fast evaluations
             self.utility_llm = create_utility_llm_from_config(config)
             if self.utility_llm:
-                logger.info(f"Initialized utility LLM for quick evaluations")
-            else:
-                logger.info("No utility LLM configured, using main LLM for evaluations")
+                logger.info("Initialized utility LLM")
 
             # Initialize Redis-backed managers if available
             if Config.REDIS_URL:
@@ -128,20 +128,29 @@ class VegaCore(commands.Cog, CollaborativeCogMixin, AgentAcknowledgmentMixin):
                     self.project_manager = ProjectManager(Config.REDIS_URL)
                     self.conversation_manager = ConversationManager(Config.REDIS_URL)
                     self.memory_manager = MemoryManager(Config.REDIS_URL)
-                    logger.info("Initialized Redis-backed managers (including MemoryManager)")
+                    logger.info("Initialized Redis-backed managers")
                 except ImportError as e:
                     logger.warning(f"Redis managers not available: {e}")
 
             # Load agent registry for @mention support
             self._agent_registry = self._load_agent_registry()
 
-            # Initialize distributed tracker for inter-agent communication
+            # Initialize distributed tracker
             if self._agent_registry:
                 self.tracker = DistributedAgentTracker(
                     own_name="vega",
                     agent_registry=self._agent_registry,
                 )
                 logger.info("Distributed agent tracker initialized")
+
+            # Initialize job graph executor
+            max_timeout = int(os.environ.get("JOB_MAX_TIMEOUT", "600"))
+            self.executor = JobGraphExecutor(
+                bot=self.bot,
+                agent_registry=self._agent_registry,
+                max_timeout=max_timeout,
+            )
+            logger.info(f"Job graph executor initialized (max_timeout={max_timeout}s)")
 
             # Create Vega agent
             self.vega_agent = VegaAgent(
@@ -162,31 +171,59 @@ class VegaCore(commands.Cog, CollaborativeCogMixin, AgentAcknowledgmentMixin):
 
     def cog_unload(self):
         self.message_queue.stop()
+        self.timeout_checker.cancel()
+
+    # --------------------------------------------------
+    # TIMEOUT CHECKER - periodic task
+    # --------------------------------------------------
+
+    @tasks.loop(seconds=15)
+    async def timeout_checker(self):
+        """Check for timed-out graph nodes and trigger re-evaluation."""
+        if not self.executor:
+            return
+
+        timed_out = self.executor.check_timeouts()
+        for graph, node in timed_out:
+            logger.warning(
+                f"[Vega] Node '{node.id}' timed out in graph '{graph.id}' "
+                f"(agent={node.agent}, timeout={node.timeout}s)"
+            )
+            # Post timeout embed to thread
+            await self.executor._post_timeout_embed(graph, node)
+
+            # Trigger Vega re-evaluation with the timeout context
+            channel = self.bot.get_channel(graph.channel_id)
+            if channel and self.vega_agent:
+                context = AgentContext(
+                    channel_id=graph.channel_id,
+                    user_id=0,  # System-triggered
+                    message_content=f"[SYSTEM] Node '{node.id}' (agent: {node.agent}) timed out. Evaluate and decide: retry, reassign, or fail the goal.",
+                    conversation_id=await self._get_or_create_conversation(
+                        channel_id=graph.channel_id,
+                        user_id=0,
+                    ),
+                )
+                await self.message_queue.enqueue(
+                    message=None,
+                    context=context,
+                    is_from_agent=False,
+                )
+
+    @timeout_checker.before_loop
+    async def before_timeout_checker(self):
+        await self.bot.wait_until_ready()
 
     # --------------------------------------------------
     # MESSAGE HANDLER
     # --------------------------------------------------
 
-    def _get_mentioned_other_agent(self, message: discord.Message) -> str | None:
-        """
-        Check if another agent (not Vega) was mentioned in the message.
-
-        Returns the agent name if found, None otherwise.
-        """
-        for user in message.mentions:
-            # Check if this mentioned user is a known agent (and not Vega)
-            for agent_name, agent_id in self._agent_registry.items():
-                if user.id == agent_id and agent_name != 'vega':
-                    return agent_name
-
-        return None
-
     @commands.Cog.listener()
-    async def on_message(self, message):
+    async def on_message(self, message: discord.Message):
         if message.author == self.bot.user:
             return
 
-        # Track activity from other agents (for distributed status inference)
+        # Track activity from other agents
         if self.tracker:
             observed_agent = self.tracker.observe_message(message)
             if observed_agent:
@@ -199,14 +236,20 @@ class VegaCore(commands.Cog, CollaborativeCogMixin, AgentAcknowledgmentMixin):
             )
             return
 
-        if message.author.id != Config.ALLOWED_USER_ID:
-            # Still process if it's from another agent (for chime-in)
-            is_from_agent = any(
-                message.author.id == agent_id
-                for agent_id in self._agent_registry.values()
-            )
-            if not is_from_agent:
-                return
+        # Ignore messages in planning threads (Vega's own status updates)
+        if self.executor and isinstance(message.channel, discord.Thread):
+            graph = self.executor.get_graph_by_thread(message.channel.id)
+            if graph:
+                return  # This is a planning thread, ignore
+
+        # Determine message source
+        is_from_user = message.author.id == Config.ALLOWED_USER_ID
+        agent_name = is_from_known_agent(message, self._agent_registry)
+        is_from_agent = agent_name is not None
+
+        # Ignore messages from unknown users/bots
+        if not is_from_user and not is_from_agent:
+            return
 
         content = message.content.strip()
 
@@ -214,32 +257,17 @@ class VegaCore(commands.Cog, CollaborativeCogMixin, AgentAcknowledgmentMixin):
         if content.startswith('!'):
             return
 
-        # Check if user mentioned another agent - evaluate chime-in only
-        mentioned_other = self._get_mentioned_other_agent(message)
-        if mentioned_other:
-            logger.debug(f"User mentioned @{mentioned_other}, checking chime-in for Vega")
-            if self._agent_initialized and self.main_channel_id:
-                await self.evaluate_and_maybe_chime_in(message)
+        # ---- AGENT MESSAGE: route to graph node ----
+        if is_from_agent and agent_name:
+            await self._handle_agent_response(message, agent_name)
             return
 
-        # Check if message is from another agent - evaluate chime-in
-        is_from_agent = any(
-            message.author.id == agent_id
-            for agent_id in self._agent_registry.values()
-        )
-        if is_from_agent:
-            logger.debug(f"Message from agent, evaluating chime-in for Vega")
-            if self._agent_initialized and self.main_channel_id:
-                await self.evaluate_and_maybe_chime_in(message)
-            return
-
-        # Regular conversation: queue for Vega processing
+        # ---- USER MESSAGE: trigger Vega processing ----
         if content and self._agent_initialized:
-            # Get or create conversation for this channel
             conversation_id = await self._get_or_create_conversation(
                 channel_id=message.channel.id,
                 user_id=message.author.id,
-                guild_id=message.guild.id if message.guild else None
+                guild_id=message.guild.id if message.guild else None,
             )
 
             context = AgentContext(
@@ -250,21 +278,88 @@ class VegaCore(commands.Cog, CollaborativeCogMixin, AgentAcknowledgmentMixin):
                 conversation_id=conversation_id,
             )
 
-            # Add to queue for sequential processing
             await self.message_queue.enqueue(
                 message=message,
                 context=context,
                 is_from_agent=False,
             )
 
+    # --------------------------------------------------
+    # AGENT RESPONSE HANDLING
+    # --------------------------------------------------
+
+    async def _handle_agent_response(self, message: discord.Message, agent_name: str):
+        """
+        Handle a response from another agent.
+
+        Match it to a running graph node and trigger Vega re-evaluation
+        so she can update the node, dispatch more work, or respond to user.
+        """
+        if not self.executor or not self.vega_agent:
+            return
+
+        channel_id = message.channel.id
+
+        # Find the graph node this response corresponds to
+        match = self.executor.find_node_for_agent_response(agent_name, channel_id)
+
+        if not match:
+            logger.debug(
+                f"[Vega] Agent '{agent_name}' responded but no matching node found. "
+                f"Ignoring (may be unprompted or from a completed graph)."
+            )
+            return
+
+        graph, node = match
+        logger.info(
+            f"[Vega] Agent '{agent_name}' responded to node '{node.id}' "
+            f"in graph '{graph.id}'"
+        )
+
+        # Post agent response embed to the planning thread
+        import discord as _discord
+        content_preview = message.content[:300] if message.content else "(no text)"
+        embed = _discord.Embed(
+            description=f"**{agent_name}** → `{node.id}`\n{content_preview}",
+            color=0x5865F2,  # Blurple
+        )
+        await self.executor._send_to_thread(graph, embed=embed)
+
+        # Trigger Vega re-evaluation with the agent's response
+        # The agent's message is already in Discord history, so Vega will see it
+        # in _fetch_discord_history. We just need to prompt her to re-evaluate.
+        conversation_id = await self._get_or_create_conversation(
+            channel_id=channel_id,
+            user_id=0,
+        )
+
+        context = AgentContext(
+            channel_id=channel_id,
+            user_id=0,  # System-triggered (agent response)
+            message_content=(
+                f"[AGENT RESPONSE] {agent_name} responded to node '{node.id}' "
+                f"(graph: {graph.id}). Evaluate the response, call update_node to mark "
+                f"it completed/failed, and decide next steps."
+            ),
+            conversation_id=conversation_id,
+        )
+
+        await self.message_queue.enqueue(
+            message=message,
+            context=context,
+            is_from_agent=True,
+        )
+
+    # --------------------------------------------------
+    # REACTION HANDLER
+    # --------------------------------------------------
+
     @commands.Cog.listener()
     async def on_reaction_add(self, reaction: discord.Reaction, user: discord.User):
         """Track reactions from other agents for acknowledgment detection."""
-        # Ignore own reactions
         if user == self.bot.user:
             return
 
-        # Track reactions from other agents
         if self.tracker:
             observed_agent = self.tracker.observe_reaction(
                 message_id=reaction.message.id,
@@ -276,25 +371,91 @@ class VegaCore(commands.Cog, CollaborativeCogMixin, AgentAcknowledgmentMixin):
                     f"[Vega] Observed reaction from {observed_agent}: {reaction.emoji}"
                 )
 
+    # --------------------------------------------------
+    # QUEUE PROCESSOR
+    # --------------------------------------------------
+
+    async def _process_queued_message(
+        self,
+        message: Optional[discord.Message],
+        context: AgentContext,
+        is_from_agent: bool,
+    ):
+        """Process a message from the queue - runs Vega's process loop."""
+        if not self.vega_agent:
+            if message:
+                await message.channel.send("Vega agent not available.")
+            return
+
+        # Get channel for typing indicator
+        channel = None
+        if message:
+            channel = message.channel
+        elif context.channel_id:
+            channel = self.bot.get_channel(context.channel_id)
+
+        async def _run():
+            response = await self.vega_agent.process(
+                context=context,
+                job_executor=self.executor,
+                trigger_message=message,  # For thread creation in create_plan
+            )
+
+            if response.content:
+                target_channel = channel
+                if not target_channel:
+                    return
+
+                chunks = self._split_message(response.content)
+                logger.info(
+                    f"[Vega] SENDING RESPONSE: chunks={len(chunks)}, "
+                    f"total_len={len(response.content)}, "
+                    f"tool_calls={response.tool_calls_made}"
+                )
+                for chunk in chunks:
+                    await target_channel.send(chunk)
+            else:
+                logger.info(
+                    f"[Vega] NO RESPONSE CONTENT: "
+                    f"tool_calls={response.tool_calls_made} (dispatched work)"
+                )
+
+            logger.info(
+                f"[Vega] PROCESS COMPLETE: time={response.processing_time_ms}ms, "
+                f"tools={response.tool_calls_made}"
+            )
+
+        if channel:
+            async with channel.typing():
+                try:
+                    await _run()
+                except Exception as e:
+                    logger.error(f"[Vega] PROCESS ERROR: {e}", exc_info=True)
+                    await channel.send(f"**Error:** {e}")
+        else:
+            # No channel for typing indicator (system-triggered)
+            try:
+                await _run()
+            except Exception as e:
+                logger.error(f"[Vega] PROCESS ERROR (no channel): {e}", exc_info=True)
+
+    # --------------------------------------------------
+    # HELPERS
+    # --------------------------------------------------
+
     async def _get_or_create_conversation(
         self,
         channel_id: int,
         user_id: int,
-        guild_id: int = None
-    ) -> str:
-        """
-        Get existing conversation for channel or create a new one.
-
-        This ensures chat history is preserved across messages in the same channel.
-        """
+        guild_id: int = None,
+    ) -> Optional[str]:
+        """Get existing conversation for channel or create a new one."""
         if not self.conversation_manager:
             return None
 
-        # Try to get existing conversation for this channel
         conversation_id = await self.conversation_manager.get_channel_conversation(channel_id)
 
         if not conversation_id:
-            # Create new conversation for this channel
             conversation_id = await self.conversation_manager.create(
                 user_id=user_id,
                 channel_id=channel_id,
@@ -303,47 +464,6 @@ class VegaCore(commands.Cog, CollaborativeCogMixin, AgentAcknowledgmentMixin):
             logger.info(f"Created new conversation {conversation_id} for channel {channel_id}")
 
         return conversation_id
-
-    async def _process_queued_message(
-        self,
-        message: discord.Message,
-        context: AgentContext,
-        is_from_agent: bool,
-    ):
-        """Process a message from the queue - this is the actual work."""
-        if not self.vega_agent:
-            await message.channel.send("Vega agent not available.")
-            return
-
-        async with message.channel.typing():
-            try:
-                response = await self.vega_agent.process(context)
-
-                if response.content:
-                    chunks = self._split_message(response.content)
-                    logger.info(
-                        f"[Vega] SENDING RESPONSE: msg_id={message.id}, "
-                        f"chunks={len(chunks)}, total_len={len(response.content)}, "
-                        f"tool_calls={response.tool_calls_made}, "
-                        f"content_preview={response.content[:100]}..."
-                    )
-                    for i, chunk in enumerate(chunks):
-                        sent = await message.channel.send(chunk)
-                        logger.debug(f"[Vega] SENT CHUNK {i+1}/{len(chunks)}: sent_id={sent.id}")
-                else:
-                    logger.info(
-                        f"[Vega] NO RESPONSE CONTENT: msg_id={message.id}, "
-                        f"tool_calls={response.tool_calls_made} (tool-only response)"
-                    )
-
-                logger.info(
-                    f"[Vega] PROCESS COMPLETE: msg_id={message.id}, "
-                    f"time={response.processing_time_ms}ms, tools={response.tool_calls_made}"
-                )
-
-            except Exception as e:
-                logger.error(f"[Vega] PROCESS ERROR: msg_id={message.id}, error={e}", exc_info=True)
-                await message.channel.send(f"**Error:** {e}")
 
     def _split_message(self, text: str, max_len: int = 1900) -> list:
         """Split text into chunks for Discord messages."""
@@ -369,4 +489,7 @@ class VegaCore(commands.Cog, CollaborativeCogMixin, AgentAcknowledgmentMixin):
 
 
 async def setup(bot):
-    await bot.add_cog(VegaCore(bot))
+    cog = VegaCore(bot)
+    await bot.add_cog(cog)
+    # Start the timeout checker after cog is added
+    cog.timeout_checker.start()

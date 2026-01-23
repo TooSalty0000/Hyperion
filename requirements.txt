@@ -2,6 +2,8 @@ discord.py
 pexpect
 psutil
 python-dotenv
+pytest
+pytest-asyncio
 
 # LLM Providers (install the one you need)
 google-genai  # For Gemini

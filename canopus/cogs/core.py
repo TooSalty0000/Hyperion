@@ -17,7 +17,6 @@ from shared.agent_coordinator import (
     REACTION_ACK,
     REACTION_DONE,
 )
-from shared.collaboration import CollaborativeCogMixin
 from canopus.agent import CanopusAgent
 from canopus.browser.manager import BrowserSessionManager
 from canopus.config import get_config
@@ -25,7 +24,7 @@ from canopus.config import get_config
 logger = logging.getLogger(__name__)
 
 
-class CanopusCore(commands.Cog, CollaborativeCogMixin, AgentAcknowledgmentMixin):
+class CanopusCore(commands.Cog, AgentAcknowledgmentMixin):
     """
     Core cog for the Canopus Discord bot.
 
@@ -35,7 +34,6 @@ class CanopusCore(commands.Cog, CollaborativeCogMixin, AgentAcknowledgmentMixin)
     - Browser session management per channel
     - Cleanup of idle browser sessions
     - Distributed agent tracking and acknowledgment
-    - Collaborative chime-in evaluation for proactive agent participation
     """
 
     def __init__(self, bot: commands.Bot):
@@ -67,10 +65,6 @@ class CanopusCore(commands.Cog, CollaborativeCogMixin, AgentAcknowledgmentMixin)
 
         # Track message IDs we've acknowledged to avoid duplicate acks
         self._acknowledged_message_ids: set = set()
-
-        # CollaborativeCogMixin requirements
-        self.main_channel_id: Optional[int] = self.config.main_channel_id if hasattr(self.config, 'main_channel_id') else None
-        self._agent_registry: dict = self.config.agent_registry.agents if self.config.agent_registry else {}
 
     async def cog_load(self):
         """Async initialization after cog is loaded."""
@@ -141,12 +135,8 @@ class CanopusCore(commands.Cog, CollaborativeCogMixin, AgentAcknowledgmentMixin)
             model=self.config.llm_model,
         )
 
-        # Create utility LLM for cheap/fast evaluations (chime-in, etc.)
+        # Create utility LLM for lightweight evaluations
         utility_llm = create_utility_llm_from_config(self.config)
-        if utility_llm:
-            logger.info("Initialized utility LLM for quick evaluations")
-        else:
-            logger.info("No utility LLM configured, using main LLM for evaluations")
 
         # Initialize the Canopus agent
         self.agent = CanopusAgent(
@@ -194,15 +184,8 @@ class CanopusCore(commands.Cog, CollaborativeCogMixin, AgentAcknowledgmentMixin)
         if not is_allowed_user and not is_from_agent:
             return
 
-        # Check if this bot is mentioned
+        # Only respond when explicitly @mentioned
         if not self.bot.user or not self.bot.user.mentioned_in(message):
-            # Not mentioned - evaluate chime-in for messages in main channel
-            if self.main_channel_id and message.channel.id == self.main_channel_id:
-                if self.agent:
-                    logger.debug(f"[Canopus] Checking chime-in for: {message.content[:50]}...")
-                    await self.evaluate_and_maybe_chime_in(message)
-                else:
-                    logger.warning(f"[Canopus] Agent not initialized, skipping chime-in")
             return
 
         # Process the mention

@@ -524,8 +524,8 @@ When you learn something important about websites or research findings, use stor
         scratchpad = NavigationScratchpad()
 
         try:
-            # Build and cache memory context (reused for chime-in evaluations)
-            memory_context_str = await self.build_and_cache_memory_context(context.message_content)
+            # Build memory context
+            memory_context_str = await self.build_memory_context(context.message_content)
 
             # Build conversation messages
             messages = await self._build_messages(context, memory_context_str)

@@ -39,6 +39,15 @@ class ToolContext:
     # Callback for starting output loops (set by agent/cog)
     start_output_loop_callback: Optional[Any] = None
 
+    # Job graph executor (for Vega's orchestration tools)
+    job_executor: Optional[Any] = None  # JobGraphExecutor
+
+    # Trigger message (for thread creation in graph tools)
+    trigger_message: Optional[Any] = None  # discord.Message
+
+    # Response message (set by RespondToUserTool, read by cog)
+    response_message: Optional[str] = None
+
     def with_session(self, session_id: int) -> 'ToolContext':
         """Create a new context with updated session ID."""
         return ToolContext(

@@ -16,14 +16,13 @@ from shared.agent_coordinator import (
     REACTION_ACK,
     REACTION_DONE,
 )
-from shared.collaboration.cog_mixin import CollaborativeCogMixin
 from polaris.agent import PolarisAgent
 from polaris.config import get_config
 
 logger = logging.getLogger(__name__)
 
 
-class PolarisCore(commands.Cog, AgentAcknowledgmentMixin, CollaborativeCogMixin):
+class PolarisCore(commands.Cog, AgentAcknowledgmentMixin):
     """
     Core cog for the Polaris Discord bot.
 
@@ -65,10 +64,6 @@ class PolarisCore(commands.Cog, AgentAcknowledgmentMixin, CollaborativeCogMixin)
 
         # Track message IDs we've acknowledged to avoid duplicate acks
         self._acknowledged_message_ids: set = set()
-
-        # CollaborativeCogMixin requirements
-        self.main_channel_id: Optional[int] = self.config.main_channel_id
-        self._agent_registry: dict = self.config.agent_registry.agents
 
     async def cog_load(self):
         """Async initialization after cog is loaded."""
@@ -125,12 +120,8 @@ class PolarisCore(commands.Cog, AgentAcknowledgmentMixin, CollaborativeCogMixin)
             model=self.config.llm_model,
         )
 
-        # Create utility LLM for cheap/fast evaluations (chime-in, etc.)
+        # Create utility LLM for lightweight evaluations
         utility_llm = create_utility_llm_from_config(self.config)
-        if utility_llm:
-            logger.info("Initialized utility LLM for quick evaluations")
-        else:
-            logger.info("No utility LLM configured, using main LLM for evaluations")
 
         # Initialize the Polaris agent
         self.agent = PolarisAgent(
@@ -230,20 +221,11 @@ class PolarisCore(commands.Cog, AgentAcknowledgmentMixin, CollaborativeCogMixin)
         if not is_allowed_user and not is_from_agent:
             return
 
-        # Check if this bot is mentioned
-        polaris_mentioned = self.bot.user and self.bot.user.mentioned_in(message)
+        # Only respond when explicitly @mentioned
+        if not self.bot.user or not self.bot.user.mentioned_in(message):
+            return
 
-        if polaris_mentioned:
-            # Direct mention - process normally
-            await self._handle_mention(message, is_from_agent)
-        elif self.main_channel_id and message.channel.id == self.main_channel_id:
-            # Message in main channel without mentioning Polaris - evaluate chime-in
-            # This allows Polaris to proactively respond to relevant messages
-            if self.agent:
-                logger.debug(f"[Polaris] Checking chime-in for: {message.content[:50]}...")
-                await self.evaluate_and_maybe_chime_in(message)
-            else:
-                logger.warning(f"[Polaris] Agent not initialized, skipping chime-in")
+        await self._handle_mention(message, is_from_agent)
 
     @commands.Cog.listener()
     async def on_reaction_add(self, reaction: discord.Reaction, user: discord.User):

@@ -7,9 +7,9 @@ Hyperion is a multi-agent AI system where specialized bots collaborate via Disco
 | Agent | Role | Specialization |
 |-------|------|----------------|
 | **Vega** | Conversational Lead | General conversation, strategy, delegation |
-| **Altair** | Project Manager | Terminal sessions, CLI tools, code execution |
-| **Polaris** | Calendar Specialist | Scheduling, events, reminders, time management |
-| **Canopus** | Web Researcher | Browser automation, web search, data extraction |
+| **Altair** | Project Manager | Terminal sessions, CLI tools, code execution, ngrok tunnels |
+| **Polaris** | Calendar Specialist | Google Calendar, scheduling, events, time management |
+| **Canopus** | Web Researcher | Playwright browser automation, web search, data extraction |
 
 ## Key Features
 
@@ -18,50 +18,131 @@ Hyperion is a multi-agent AI system where specialized bots collaborate via Disco
 - **Chime-In System**: Agents proactively respond to relevant messages without being explicitly mentioned
 - **Automatic Handoffs**: Agents can hand off findings to the right specialist automatically
 - **Shared State**: Redis-backed project management, memory, and conversations
+- **Permission System**: Altair requests human approval for sensitive operations
+- **Local Terminal Attachment**: Tmux sessions can be attached to locally while controlled from Discord
 
----
+## Quick Start
 
-# Vega - Discord CLI Bridge (Legacy Docs)
+### 1. Install Dependencies
 
-Vega is a Discord bot that acts as a secure bridge to your local terminal, allowing you to interact with CLI agents (like Claude, Gemini, or standard shells) remotely from your phone.
+```bash
+make install
+# or: pip install -r requirements.txt
 
-## Setup
+# For Canopus browser automation:
+playwright install chromium
+```
 
-1.  **Install Dependencies**:
-    ```bash
-    pip install -r requirements.txt
-    ```
+### 2. Configure Environment
 
-2.  **Environment Configuration**:
-    Copy `.env.example` to `.env` and fill in your details:
-    ```bash
-    cp .env.example .env
-    ```
-    - `DISCORD_TOKEN`: Your bot token from the [Discord Developer Portal](https://discord.com/developers/applications).
-        > **IMPORTANT**: In the "Bot" tab of the Developer Portal, scroll down to **Privileged Gateway Intents** and enable **MESSAGE CONTENT INTENT**. The bot cannot read your commands without this!
-    - `ALLOWED_USER_ID`: Your personal Discord User ID.
-        1. Open Discord Settings -> Advanced -> Enable **Developer Mode**.
-        2. Right-click your own Avatar/Name in any chat or the member list.
-        3. Click **Copy User ID** (or just **Copy ID**).
-    - `CLI_COMMAND`: The command to run. Defaults to `zsh`. To run an agent, set it to something like `claude` or `python my_agent.py`.
-    - `WORKSPACE_DIR`: (Optional) The directory to start the process in. Useful for scoping the agent to a specific project.
+```bash
+cp .env.example .env
+```
 
-3.  **Run the Bot**:
-    ```bash
-    python bot.py
-    ```
+Each agent needs its own Discord bot token. See `.env.example` for the full configuration reference including:
+- Discord bot tokens (one per agent)
+- LLM provider settings (Gemini, OpenAI, or Anthropic)
+- Agent-specific settings (terminal, calendar, browser)
+- Redis connection (optional, enables persistence)
 
-## Usage
+### 3. Run the Bots
 
-*   **`!v [command]`** or **`!vega [command]`**: Send input to the running process.
-    *   Example: `!v ls -la`
-    *   Example: `!v Please write a poem about rust.`
-*   **`!v status`**: Check if the process is running and view host stats.
-*   **`!v reset`**: Kill and restart the CLI process.
+```bash
+# Start all bots
+make start
+# or: python run_all.py
 
-## Handling Interactive CLIs
+# Start specific bots
+python run_all.py --vega --altair
+python run_all.py --polaris
+make start-vega
+make start-altair
+```
 
-Vega uses `pexpect` to maintain a persistent session.
-- **Yes/No Prompts**: If the CLI asks `Do you want to continue? [y/n]`, you simply type `!v y` in Discord.
-- **Streaming**: Output is buffered and sent to Discord in chunks.
-- **ANSI Colors**: Terminal colors are automatically stripped to keep Discord messages clean.
+## Discord Commands
+
+### Altair Terminal Commands (`!vli`)
+
+- `!vli` - Start new CLI session (creates a dedicated channel)
+- `!vli ls` - List all active sessions
+- `!vli quit` - Send Ctrl+C to current session
+- `!vli exit [id]` - Terminate session (deletes channel)
+- `!vli ctrl-d` / `!vli ctrl-z` / `!vli ctrl-l` - Control keys
+- `!vli status` - Show current session status
+- `!vli attach` - Show command to attach locally (tmux)
+- `!vli resize <cols> <rows>` - Resize terminal
+- `!vli mode <scroll|ui>` - Change display mode
+- `!vli <key>` - Send special key (up, down, enter, esc)
+- **Plain text in session channel** - Sends directly to process (no prefix needed)
+
+### Local Terminal Attachment
+
+When using the tmux backend, you can attach to sessions locally:
+```bash
+tmux attach -t vega-1  # Attach to session #1
+```
+
+This allows both Discord control AND local terminal control simultaneously.
+
+## Deployment
+
+### Local (Recommended for Development)
+
+```bash
+python run_all.py  # All bots in one process with graceful shutdown
+```
+
+### Docker Compose (Full System)
+
+```bash
+docker-compose up -d              # Start Redis + all 4 bots
+docker-compose up -d vega altair  # Start specific services
+docker-compose logs -f vega       # Follow logs
+docker-compose down               # Stop everything
+```
+
+### Distributed (Across Machines)
+
+Each bot can run on a separate machine using `docker-compose.single-bot.yml`. Agents communicate only via Discord messages, so no shared network is required beyond Discord API access.
+
+## Architecture Overview
+
+```
+run_all.py              # Entry point - starts all bots concurrently
+vega/                   # Vega agent (conversational lead)
+altair/                 # Altair agent (CLI/project specialist)
+polaris/                # Polaris agent (calendar specialist)
+canopus/                # Canopus agent (web/browser specialist)
+shared/                 # Common framework shared by all agents
+  base_agent.py         #   BaseAgent ABC - core agent loop
+  llm/                  #   LLM provider abstraction (Gemini, OpenAI, Anthropic)
+  tools/                #   Tool framework (registry, interface, context)
+  terminal/             #   Terminal backends (tmux, pexpect)
+  session/              #   Session lifecycle management
+  channel/              #   Discord channel management
+  memory/               #   Redis-backed persistent memory
+  project/              #   Project tracking and status
+  conversation/         #   Conversation history management
+  collaboration/        #   Chime-in system and suppression
+  database/             #   Session stores (memory, file, Redis)
+  events/               #   Event dispatcher for agent events
+docker-compose.yml      # Full deployment (Redis + 4 bots)
+```
+
+## Bot Permissions Required
+
+- Manage Channels (create/delete session channels)
+- Send Messages
+- Read Messages / Message Content Intent
+- Manage Messages (edit for UI mode)
+- Add Reactions (acknowledgment protocol)
+
+## Dependencies
+
+- Python 3.10+
+- discord.py
+- google-genai (Gemini LLM - primary provider)
+- pexpect, psutil (terminal management)
+- playwright (Canopus browser automation)
+- redis (optional - persistence)
+- httpx (ngrok tunnel management)

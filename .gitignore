@@ -36,7 +36,6 @@ env/
 # Environment & Secrets (CRITICAL - Never commit these!)
 # -----------------------------------------------------------------------------
 .env
-.env.*
 .env.local
 .env.*.local
 .env.docker

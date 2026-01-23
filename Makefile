@@ -1,4 +1,4 @@
-.PHONY: help install start start-vega start-altair start-all clean test-imports
+.PHONY: help install start start-vega start-altair start-all clean test-imports test
 
 PYTHON = python3
 PIP = pip3
@@ -11,6 +11,7 @@ help:
 	@echo "make start-vega    - Run Vega bot"
 	@echo "make start-altair  - Run Altair bot"
 	@echo "make start-all     - Run all bots (Vega + Altair)"
+	@echo "make test          - Run pytest test suite"
 	@echo "make test-imports  - Test all module imports"
 	@echo "make clean         - Remove pycache and temporary files"
 
@@ -27,6 +28,9 @@ start-altair:
 
 start-all:
 	$(PYTHON) run_all.py
+
+test:
+	$(PYTHON) -m pytest tests/ -v
 
 test-imports:
 	@$(PYTHON) -c "from shared import BaseAgent, AgentContext, AgentResponse; print('✅ shared imports OK')"

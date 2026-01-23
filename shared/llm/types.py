@@ -22,6 +22,10 @@ class ToolParameter:
     required: bool = True
     enum: Optional[List[str]] = None
     default: Optional[Any] = None
+    # For array types: schema of each item (JSON Schema dict)
+    items: Optional[Dict[str, Any]] = None
+    # For object types: nested properties (JSON Schema dict)
+    properties: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -45,6 +49,10 @@ class ToolDefinition:
                 prop["enum"] = param.enum
             if param.default is not None:
                 prop["default"] = param.default
+            if param.items:
+                prop["items"] = param.items
+            if param.properties:
+                prop["properties"] = param.properties
             properties[param.name] = prop
             if param.required:
                 required.append(param.name)

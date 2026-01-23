@@ -23,7 +23,6 @@ from shared.agent_coordinator import (
     REACTION_ACK,
     REACTION_DONE,
 )
-from shared.collaboration import CollaborativeCogMixin
 from altair.agent import AltairAgent
 from altair.config import get_config
 from altair.permission import PermissionManager
@@ -31,7 +30,7 @@ from altair.permission import PermissionManager
 logger = logging.getLogger(__name__)
 
 
-class AltairCore(commands.Cog, CollaborativeCogMixin, AgentAcknowledgmentMixin):
+class AltairCore(commands.Cog, AgentAcknowledgmentMixin):
     """
     Core cog for the Altair Discord bot.
 
@@ -42,7 +41,6 @@ class AltairCore(commands.Cog, CollaborativeCogMixin, AgentAcknowledgmentMixin):
     - Session management integration
     - VLI terminal commands
     - Distributed agent tracking and acknowledgment
-    - Collaborative chime-in evaluation for proactive agent participation
     """
 
     # VLI command constants
@@ -98,10 +96,6 @@ class AltairCore(commands.Cog, CollaborativeCogMixin, AgentAcknowledgmentMixin):
 
         # Track message IDs we've acknowledged to avoid duplicate acks
         self._acknowledged_message_ids: set = set()
-
-        # CollaborativeCogMixin requirements
-        self.main_channel_id: Optional[int] = self.config.main_channel_id if hasattr(self.config, 'main_channel_id') else None
-        self._agent_registry: dict = self.config.agent_registry.agents if self.config.agent_registry else {}
 
     async def cog_load(self):
         """Async initialization after cog is loaded."""
@@ -198,12 +192,8 @@ class AltairCore(commands.Cog, CollaborativeCogMixin, AgentAcknowledgmentMixin):
             model=self.config.llm_model,
         )
 
-        # Create utility LLM for cheap/fast evaluations (chime-in, etc.)
+        # Create utility LLM for lightweight evaluations
         utility_llm = create_utility_llm_from_config(self.config)
-        if utility_llm:
-            logger.info("Initialized utility LLM for quick evaluations")
-        else:
-            logger.info("No utility LLM configured, using main LLM for evaluations")
 
         # Initialize the Altair agent
         self.agent = AltairAgent(
@@ -376,15 +366,8 @@ class AltairCore(commands.Cog, CollaborativeCogMixin, AgentAcknowledgmentMixin):
             await session.terminal.send_input(content + '\n')
             return
 
-        # Check if this bot is mentioned
+        # Only respond when explicitly @mentioned
         if not self.bot.user or not self.bot.user.mentioned_in(message):
-            # Not mentioned - evaluate chime-in for messages in main channel
-            if self.main_channel_id and message.channel.id == self.main_channel_id:
-                if self.agent:
-                    logger.debug(f"[Altair] Checking chime-in for: {message.content[:50]}...")
-                    await self.evaluate_and_maybe_chime_in(message)
-                else:
-                    logger.warning(f"[Altair] Agent not initialized, skipping chime-in")
             return
 
         # Process the mention
