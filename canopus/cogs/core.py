@@ -286,6 +286,7 @@ class CanopusCore(commands.Cog, AgentAcknowledgmentMixin):
             guild_id=message.guild.id if message.guild else None,
             mentioned_agent="canopus",
             conversation_id=conversation_id,
+            is_from_agent=is_from_agent,
         )
 
         # Add to queue for sequential processing
@@ -373,7 +374,7 @@ class CanopusCore(commands.Cog, AgentAcknowledgmentMixin):
             content = content[:max_total_length] + "\n\n... [Response truncated due to length]"
 
         if len(content) <= max_length:
-            await channel.send(content)
+            await channel.send(content, silent=True)
             return
 
         # Split into chunks (max 3 to prevent spam)
@@ -400,7 +401,7 @@ class CanopusCore(commands.Cog, AgentAcknowledgmentMixin):
             chunks[-1] = chunks[-1].rstrip() + "\n\n... [Response truncated]"
 
         for chunk in chunks:
-            await channel.send(chunk)
+            await channel.send(chunk, silent=True)
 
     def _clean_repetitive_content(self, content: str) -> str:
         """Detect and clean repetitive content patterns."""

@@ -2,6 +2,7 @@
 
 import time
 import logging
+from datetime import datetime, timezone
 from typing import Optional, List, TYPE_CHECKING
 
 from shared.base_agent import BaseAgent, AgentContext, AgentResponse
@@ -62,6 +63,7 @@ CRITICAL RULES:
 - NEVER prefix your messages with "Vega:" - Discord shows who's talking
 - NEVER duplicate tool actions in your response text
 - When a plan is active and agents respond, evaluate their responses and call `update_node`
+- AFTER marking a node complete, check if remaining PENDING/READY nodes are still needed. If the agent's response already covers their work, cancel them with `cancel_nodes`. Do NOT dispatch redundant work.
 - If you can answer from memory/knowledge alone, use a think→respond plan (no dispatch)
 - Set realistic timeouts. If something will take long, tell the user you're working on it
 """
@@ -141,7 +143,13 @@ class VegaAgent(BaseAgent):
         """
         tools_desc = self.get_tools_description()
 
+        # Get current time for context
+        now = datetime.now(timezone.utc)
+        current_time_str = now.strftime("%A, %B %d, %Y at %H:%M UTC")
+
         base_prompt = f"""{self.persona}
+
+CURRENT TIME: {current_time_str}
 
 AVAILABLE TOOLS:
 {tools_desc}"""
@@ -281,6 +289,21 @@ When you need to recall past information, check your active context above or use
                     logger.info(f"[Vega] respond_to_user called, stopping loop")
                     return AgentResponse(
                         content=tool_context.response_message,
+                        agent_name=self.name,
+                        tool_calls_made=tool_calls_made,
+                        processing_time_ms=processing_time,
+                    )
+
+                # Check if work was dispatched to external agents - yield and wait
+                # for agent responses (VegaCore will re-invoke process() when they reply)
+                if tool_context.dispatched_to_agents:
+                    processing_time = int((time.time() - start_time) * 1000)
+                    logger.info(
+                        f"[Vega] Dispatched to agents, yielding loop. "
+                        f"tools={tool_calls_made}, time={processing_time}ms"
+                    )
+                    return AgentResponse(
+                        content=None,
                         agent_name=self.name,
                         tool_calls_made=tool_calls_made,
                         processing_time_ms=processing_time,

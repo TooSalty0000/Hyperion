@@ -159,7 +159,7 @@ class JobGraphExecutor:
         message_content = f"{mention} {node.description}"
 
         try:
-            sent_msg = await channel.send(message_content)
+            sent_msg = await channel.send(message_content, silent=True)
             graph.mark_running(node.id, message_id=sent_msg.id)
             logger.info(
                 f"[Executor] Dispatched node {node.id} to {node.agent}: "
@@ -405,7 +405,7 @@ class JobGraphExecutor:
         try:
             thread = self.bot.get_channel(graph.thread_id)
             if thread:
-                await thread.send(content=content, embed=embed)
+                await thread.send(content=content, embed=embed, silent=True)
         except discord.HTTPException as e:
             logger.warning(f"[Executor] Failed to send to thread: {e}")
 
@@ -432,7 +432,7 @@ class JobGraphExecutor:
             if thread:
                 if len(message) > 1900:
                     message = message[:1900] + "..."
-                await thread.send(message)
+                await thread.send(message, silent=True)
         except discord.HTTPException as e:
             logger.warning(f"[Executor] Failed to post to thread: {e}")
 

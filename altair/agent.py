@@ -767,18 +767,33 @@ When you need to recall past information, check your active context above or use
         else:
             logger.warning(f"Altair: No discord_bot ({self.discord_bot is not None}) or channel_id ({context.channel_id})")
 
-        # Add current user message (with author name for context)
-        user_name = f"User {context.user_id}"  # Default fallback
-        if self.discord_bot:
-            try:
-                user = await self.discord_bot.fetch_user(context.user_id)
-                user_name = user.display_name or user.name
-            except Exception:
-                pass
+        # Frame the current message based on source
+        if context.is_from_agent:
+            # Dispatch from Vega — frame as authoritative directive
+            messages.append(
+                Message(
+                    role=Role.USER,
+                    content=(
+                        f"[DISPATCH FROM VEGA - THIS IS YOUR TASK]:\n"
+                        f"{context.message_content}\n\n"
+                        f"Do EXACTLY this task. The chat history above is for context only. "
+                        f"Do not infer additional work beyond what is stated here."
+                    ),
+                )
+            )
+        else:
+            # Direct user message
+            user_name = f"User {context.user_id}"  # Default fallback
+            if self.discord_bot:
+                try:
+                    user = await self.discord_bot.fetch_user(context.user_id)
+                    user_name = user.display_name or user.name
+                except Exception:
+                    pass
 
-        messages.append(
-            Message(role=Role.USER, content=f"[{user_name}]: {context.message_content}")
-        )
+            messages.append(
+                Message(role=Role.USER, content=f"[{user_name}]: {context.message_content}")
+            )
 
         return messages
 

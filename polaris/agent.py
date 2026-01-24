@@ -79,6 +79,19 @@ COMMUNICATION STYLE:
 - Mention time zones when relevant
 - Proactively offer to help with related scheduling tasks
 
+WHEN DISPATCHED BY VEGA:
+When you receive a task from Vega (another agent dispatching work to you):
+- The dispatch message is your PRIMARY DIRECTIVE. Do EXACTLY what it says - nothing more, nothing less.
+- Chat history is provided for CONTEXT ONLY (to understand names, times, etc.). Do NOT infer additional tasks from history.
+- If the instruction says "create event X", create ONLY event X. Do not also delete, update, or list other events unless explicitly told to.
+- If the instruction says "delete event Y", delete ONLY event Y. Do not create replacements unless told to.
+- Report back exactly what you did. Be specific about success/failure.
+
+TOOL USAGE:
+- Use ONE tool at a time. Call a tool, wait for its result, then decide what to do next.
+- NEVER batch multiple calendar operations (e.g. list + create) in a single iteration.
+- This ensures you see each result before deciding the next action.
+
 WHEN TO DELEGATE:
 - For project management tasks, suggest @Altair
 - For strategic planning or discussions, suggest @Vega
@@ -215,10 +228,22 @@ class PolarisAgent(BaseAgent):
         """Build Polaris's system prompt with optional memory context."""
         tools_desc = self.get_tools_description()
 
-        # Add config-based context
+        # Add config-based context with current time
         config_info = ""
         if self.config:
+            tz_name = self.config.timezone
+            try:
+                import zoneinfo
+                tz = zoneinfo.ZoneInfo(tz_name)
+                now = datetime.now(tz)
+                current_time_str = now.strftime("%A, %B %d, %Y at %I:%M %p %Z")
+            except (ImportError, KeyError):
+                now = datetime.now(timezone.utc)
+                current_time_str = now.strftime("%A, %B %d, %Y at %I:%M %p UTC")
+
             config_info = f"""
+CURRENT TIME: {current_time_str}
+
 SCHEDULING PREFERENCES:
 - Default event duration: {self.config.default_event_duration_minutes} minutes
 - Working hours: {self.config.working_hours_start}:00 - {self.config.working_hours_end}:00
@@ -391,14 +416,33 @@ When you learn scheduling preferences or recurring patterns, use store_memory to
                     )
                 )
 
-            # Reached max iterations
+            # Reached max iterations - ask LLM to summarize what happened
+            messages.append(
+                Message(
+                    role=Role.USER,
+                    content=(
+                        "You've hit the maximum number of tool calls. Please summarize:\n"
+                        "1. What was originally requested\n"
+                        "2. What you attempted and what failed (be specific about errors)\n"
+                        "3. What the actual state is now (what succeeded, what didn't)\n"
+                        "4. What the caller should try differently\n"
+                        "Do NOT make any more tool calls - just summarize."
+                    ),
+                )
+            )
+
+            summary_response = await self.llm.complete(
+                messages=messages,
+                tools=None,  # No tools - force text response
+            )
+
             processing_time = int((time.time() - start_time) * 1000)
             return AgentResponse(
-                content="I've made several attempts. Please try rephrasing your request.",
+                content=summary_response.content or f"Failed to complete task after {tool_calls_made} tool calls.",
                 agent_name=self.name,
                 tool_calls_made=tool_calls_made,
                 processing_time_ms=processing_time,
-                status="partial",
+                status="error",
             )
 
         except Exception as e:
@@ -426,18 +470,33 @@ When you learn scheduling preferences or recurring patterns, use store_memory to
             logger.info(f"Polaris loaded {len(history)} messages from Discord history")
             messages.extend(history)
 
-        # Add current user message
-        user_name = f"User {context.user_id}"
-        if self.discord_bot:
-            try:
-                user = await self.discord_bot.fetch_user(context.user_id)
-                user_name = user.display_name or user.name
-            except Exception:
-                pass
+        # Frame the current message based on source
+        if context.is_from_agent:
+            # Dispatch from Vega/another agent — frame as authoritative directive
+            messages.append(
+                Message(
+                    role=Role.USER,
+                    content=(
+                        f"[DISPATCH FROM VEGA - THIS IS YOUR TASK]:\n"
+                        f"{context.message_content}\n\n"
+                        f"Do EXACTLY this task. The chat history above is for context only. "
+                        f"Do not infer additional work beyond what is stated here."
+                    ),
+                )
+            )
+        else:
+            # Direct user message
+            user_name = f"User {context.user_id}"
+            if self.discord_bot:
+                try:
+                    user = await self.discord_bot.fetch_user(context.user_id)
+                    user_name = user.display_name or user.name
+                except Exception:
+                    pass
 
-        messages.append(
-            Message(role=Role.USER, content=f"[{user_name}]: {context.message_content}")
-        )
+            messages.append(
+                Message(role=Role.USER, content=f"[{user_name}]: {context.message_content}")
+            )
 
         return messages
 

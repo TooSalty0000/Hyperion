@@ -24,6 +24,7 @@ class AgentContext:
     # Additional context that can be populated
     project_name: Optional[str] = None
     session_id: Optional[int] = None
+    is_from_agent: bool = False  # True when dispatched by another agent (e.g. Vega)
 
 
 @dataclass

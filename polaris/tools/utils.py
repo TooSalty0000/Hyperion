@@ -207,7 +207,7 @@ class CalendarCache:
 
         Args:
             title_query: Title or partial title to search for
-            date: Optional date to filter by
+            date: Optional date to filter by (naive, in user's timezone)
             fuzzy: If True, match partial titles; if False, require exact match
 
         Returns:
@@ -217,17 +217,29 @@ class CalendarCache:
         query_lower = title_query.lower()
 
         for event in self._events.values():
-            # Date filter
+            # Date filter - compare dates in a timezone-safe way
             if date:
                 event_date = event.get_date()
-                if not event_date or event_date.date() != date.date():
+                if not event_date:
+                    continue
+                # Normalize both to naive for date comparison
+                # (strip tzinfo if present to compare just the date portion)
+                event_date_naive = event_date.replace(tzinfo=None) if event_date.tzinfo else event_date
+                if event_date_naive.date() != date.date():
                     continue
 
             # Title match
             title_lower = event.summary.lower()
             if fuzzy:
+                # Match if query is substring OR if most query words appear in title
                 if query_lower in title_lower:
                     results.append(event)
+                else:
+                    # Word-level fuzzy: match if 60%+ of query words found in title
+                    query_words = set(query_lower.split())
+                    title_words = set(title_lower.split())
+                    if query_words and len(query_words & title_words) / len(query_words) >= 0.6:
+                        results.append(event)
             else:
                 if query_lower == title_lower:
                     results.append(event)
@@ -340,24 +352,24 @@ class CalendarCache:
         logger.info("[CalendarCache] Cache cleared")
 
     def get_cache_summary(self) -> str:
-        """Get a summary of the cache state for debugging."""
+        """Get a summary of the cache state with event titles for LLM self-correction."""
         if not self._events:
             return "Cache is empty. Use list_events to populate."
 
-        oldest = min(
-            (e.get_date() for e in self._events.values() if e.get_date()),
-            default=None,
+        # Show cached event titles so the LLM can correct its search
+        event_list = []
+        sorted_events = sorted(
+            self._events.values(),
+            key=lambda e: e.get_date() or datetime.max,
         )
-        newest = max(
-            (e.get_date() for e in self._events.values() if e.get_date()),
-            default=None,
-        )
+        for event in sorted_events[:15]:  # Cap at 15 to avoid flooding
+            date_str = event.get_date().strftime('%Y-%m-%d %H:%M') if event.get_date() else "?"
+            event_list.append(f"  - \"{event.summary}\" ({date_str}, id: {event.event_id[:8]}...)")
 
+        events_str = "\n".join(event_list)
         return (
-            f"Cache: {len(self._events)} events "
-            f"({oldest.strftime('%Y-%m-%d') if oldest else '?'} to "
-            f"{newest.strftime('%Y-%m-%d') if newest else '?'}), "
-            f"last fetch: {self._last_fetch_time.strftime('%H:%M:%S') if self._last_fetch_time else 'never'}"
+            f"Cache has {len(self._events)} events:\n{events_str}\n"
+            f"Last fetch: {self._last_fetch_time.strftime('%H:%M:%S') if self._last_fetch_time else 'never'}"
         )
 
     def __len__(self) -> int:
@@ -703,15 +715,19 @@ def parse_datetime(
     Args:
         date_str: Date string or relative date
         time_str: Optional time string
-        timezone: Timezone name (default UTC)
+        timezone: Timezone name (default UTC) - used for relative date calculations
 
     Returns:
-        datetime object
+        datetime object (naive, in the specified timezone's local time)
     """
     import re
     from datetime import date
-
-    now = datetime.now()
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(timezone)
+        now = datetime.now(tz).replace(tzinfo=None)  # Get local time in that tz, keep naive
+    except (ImportError, KeyError):
+        now = datetime.now()
 
     # Handle relative dates
     date_lower = date_str.lower().strip()
@@ -818,15 +834,19 @@ def _parse_time_string(time_str: str) -> "datetime.time":
 
 def format_event_for_display(event: Dict[str, Any]) -> str:
     """
-    Format a Google Calendar event for Discord display.
+    Format a Google Calendar event for LLM consumption.
+
+    Includes the event ID so the LLM can reference it directly
+    in update/delete operations without title-based lookup.
 
     Args:
         event: Event dictionary from Google Calendar API
 
     Returns:
-        Formatted string for display
+        Formatted string with title, time, and event ID
     """
     summary = event.get("summary", "No title")
+    event_id = event.get("id", "unknown")
 
     # Get start time
     start = event.get("start", {})
@@ -853,20 +873,39 @@ def format_event_for_display(event: Dict[str, Any]) -> str:
     location = event.get("location", "")
     location_str = f" @ {location}" if location else ""
 
-    return f"- **{summary}** ({time_range}){location_str}"
+    return f"- **{summary}** ({time_range}){location_str} [event_id: {event_id}]"
 
 
 def format_datetime_for_api(dt: datetime, timezone: str = "UTC") -> str:
     """
-    Format a datetime for Google Calendar API.
+    Format a datetime for Google Calendar API (RFC3339 with offset).
+
+    Google Calendar's dateTime field requires an explicit timezone offset.
+    A naive datetime like "2025-01-24T09:30:00" is interpreted as UTC by Google,
+    NOT in the timeZone specified on the start/end object. The timeZone field
+    only applies to recurring events and all-day events.
+
+    This function attaches the correct offset from the specified timezone so
+    Google interprets the time correctly.
 
     Args:
-        dt: datetime object
-        timezone: Timezone name
+        dt: datetime object (naive = assumed to be in the specified timezone)
+        timezone: IANA timezone name (e.g. "Asia/Seoul", "America/New_York")
 
     Returns:
-        ISO format string with timezone
+        RFC3339 datetime string with offset (e.g. "2025-01-24T09:30:00+09:00")
     """
-    # For simplicity, format as UTC
-    # In production, you'd want proper timezone handling
-    return dt.isoformat() + "Z" if dt.tzinfo is None else dt.isoformat()
+    if dt.tzinfo is not None:
+        # Already timezone-aware, just format
+        return dt.isoformat()
+
+    # Naive datetime: attach the specified timezone's offset
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(timezone)
+        aware_dt = dt.replace(tzinfo=tz)
+        return aware_dt.isoformat()
+    except (ImportError, KeyError):
+        # Fallback: if timezone can't be resolved, append Z (UTC)
+        logger.warning(f"Could not resolve timezone '{timezone}', defaulting to UTC")
+        return dt.isoformat() + "Z"

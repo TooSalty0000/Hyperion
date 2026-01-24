@@ -325,21 +325,30 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
         )
         await self.executor._send_to_thread(graph, embed=embed)
 
-        # Trigger Vega re-evaluation with the agent's response
-        # The agent's message is already in Discord history, so Vega will see it
-        # in _fetch_discord_history. We just need to prompt her to re-evaluate.
+        # Trigger Vega re-evaluation with the agent's actual response content
+        # Include the response directly so Vega doesn't rely solely on Discord history
         conversation_id = await self._get_or_create_conversation(
             channel_id=channel_id,
             user_id=0,
         )
+
+        # Include the agent's actual response for Vega to evaluate
+        agent_response_content = message.content[:1500] if message.content else "(no content)"
 
         context = AgentContext(
             channel_id=channel_id,
             user_id=0,  # System-triggered (agent response)
             message_content=(
                 f"[AGENT RESPONSE] {agent_name} responded to node '{node.id}' "
-                f"(graph: {graph.id}). Evaluate the response, call update_node to mark "
-                f"it completed/failed, and decide next steps."
+                f"(graph: {graph.id}).\n\n"
+                f"--- {agent_name}'s response ---\n"
+                f"{agent_response_content}\n"
+                f"--- end response ---\n\n"
+                f"Evaluate this response:\n"
+                f"1. Call update_node to mark '{node.id}' as completed or failed.\n"
+                f"2. Check remaining PENDING/READY nodes in the graph - if the agent's response "
+                f"already covers their work, cancel them with cancel_nodes.\n"
+                f"3. If all work is done, call respond_to_user with the final answer."
             ),
             conversation_id=conversation_id,
         )

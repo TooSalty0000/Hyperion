@@ -2,7 +2,7 @@
 
 import logging
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Optional
 
 from shared.tools.interface import Tool
 from shared.llm.types import ToolParameter
@@ -14,6 +14,97 @@ from polaris.tools.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def _find_event_by_title(
+    context: PolarisToolContext,
+    title: str,
+    event_date_str: Optional[str],
+    calendar_id: str,
+    timezone: str,
+) -> Optional[str]:
+    """
+    Search for an event by title via the Google Calendar API.
+
+    Queries the API directly (not cache) for reliability.
+    Returns the event_id if found, None otherwise.
+    """
+    if not context.calendar_service:
+        return None
+
+    # Determine search window
+    try:
+        if event_date_str:
+            search_date = parse_datetime(event_date_str, timezone=timezone)
+        else:
+            # Default: search today ± 1 day for flexibility
+            try:
+                import zoneinfo
+                now = datetime.now(zoneinfo.ZoneInfo(timezone)).replace(tzinfo=None)
+            except (ImportError, KeyError):
+                now = datetime.now()
+            search_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    except ValueError:
+        search_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Search a 3-day window (yesterday through tomorrow) for robustness
+    start_dt = search_date - timedelta(days=1)
+    end_dt = search_date + timedelta(days=2)
+
+    try:
+        import zoneinfo
+        tz_info = zoneinfo.ZoneInfo(timezone)
+        api_start = start_dt.replace(tzinfo=tz_info)
+        api_end = end_dt.replace(tzinfo=tz_info)
+    except (ImportError, KeyError):
+        from datetime import timezone as dt_tz
+        api_start = start_dt.replace(tzinfo=dt_tz.utc)
+        api_end = end_dt.replace(tzinfo=dt_tz.utc)
+
+    try:
+        events_result = (
+            context.calendar_service.events()
+            .list(
+                calendarId=calendar_id,
+                timeMin=api_start.isoformat(),
+                timeMax=api_end.isoformat(),
+                maxResults=50,
+                singleEvents=True,
+                orderBy="startTime",
+                q=title,  # Google's built-in text search
+            )
+            .execute()
+        )
+
+        events = events_result.get("items", [])
+
+        # Try exact match first, then substring
+        title_lower = title.lower()
+        for event in events:
+            if event.get("summary", "").lower() == title_lower:
+                logger.info(f"[FindEvent] Exact match: '{event.get('summary')}' (id: {event['id'][:8]}...)")
+                return event["id"]
+
+        # Substring match
+        for event in events:
+            if title_lower in event.get("summary", "").lower():
+                logger.info(f"[FindEvent] Substring match: '{event.get('summary')}' (id: {event['id'][:8]}...)")
+                return event["id"]
+
+        # Word overlap match (60%+ of query words in title)
+        query_words = set(title_lower.split())
+        for event in events:
+            event_words = set(event.get("summary", "").lower().split())
+            if query_words and len(query_words & event_words) / len(query_words) >= 0.6:
+                logger.info(f"[FindEvent] Fuzzy match: '{event.get('summary')}' (id: {event['id'][:8]}...)")
+                return event["id"]
+
+        logger.warning(f"[FindEvent] No match for '{title}' among {len(events)} events")
+        return None
+
+    except Exception as e:
+        logger.error(f"[FindEvent] API search failed: {e}")
+        return None
 
 
 class CreateEventTool(Tool):
@@ -90,21 +181,22 @@ class CreateEventTool(Tool):
         if not context.calendar_service:
             return "Error: Google Calendar service not available. Please configure credentials."
 
+        tz = context.config.timezone if context.config else "UTC"
         try:
-            # Parse the datetime
-            start_dt = parse_datetime(date, time)
+            # Parse the datetime in the user's timezone
+            start_dt = parse_datetime(date, time, timezone=tz)
             end_dt = start_dt + timedelta(minutes=duration_minutes)
 
-            # Build event body
+            # Build event body with timezone-aware datetimes
             event = {
                 "summary": title,
                 "start": {
-                    "dateTime": format_datetime_for_api(start_dt),
-                    "timeZone": context.config.timezone if context.config else "UTC",
+                    "dateTime": format_datetime_for_api(start_dt, timezone=tz),
+                    "timeZone": tz,
                 },
                 "end": {
-                    "dateTime": format_datetime_for_api(end_dt),
-                    "timeZone": context.config.timezone if context.config else "UTC",
+                    "dateTime": format_datetime_for_api(end_dt, timezone=tz),
+                    "timeZone": tz,
                 },
             }
 
@@ -160,8 +252,8 @@ class ListEventsTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "List upcoming calendar events. Can filter by date range. "
-            "Shows title, time, and location for each event."
+            "List upcoming calendar events. Returns title, time, location, and event_id for each event. "
+            "IMPORTANT: Use the event_id from this output when calling update_event or delete_event."
         )
 
     @property
@@ -198,30 +290,47 @@ class ListEventsTool(Tool):
         end_date = kwargs.get("end_date")
         max_results = kwargs.get("max_results", 10)
         calendar_id = kwargs.get("calendar_id", "primary")
+        tz = context.config.timezone if context.config else "UTC"
 
         if not context.calendar_service:
             return "Error: Google Calendar service not available. Please configure credentials."
 
         try:
-            # Parse dates
+            # Parse dates in the user's timezone
             if start_date:
-                start_dt = parse_datetime(start_date)
+                start_dt = parse_datetime(start_date, timezone=tz)
             else:
-                start_dt = datetime.now().replace(hour=0, minute=0, second=0)
+                try:
+                    import zoneinfo
+                    now = datetime.now(zoneinfo.ZoneInfo(tz)).replace(tzinfo=None)
+                except (ImportError, KeyError):
+                    now = datetime.now()
+                start_dt = now.replace(hour=0, minute=0, second=0)
 
             if end_date:
-                end_dt = parse_datetime(end_date)
+                end_dt = parse_datetime(end_date, timezone=tz)
                 end_dt = end_dt.replace(hour=23, minute=59, second=59)
             else:
                 end_dt = start_dt + timedelta(days=7)
+
+            # Make timezone-aware for the API query (requires RFC3339)
+            try:
+                import zoneinfo
+                tz_info = zoneinfo.ZoneInfo(tz)
+                api_start = start_dt.replace(tzinfo=tz_info)
+                api_end = end_dt.replace(tzinfo=tz_info)
+            except (ImportError, KeyError):
+                from datetime import timezone as dt_tz
+                api_start = start_dt.replace(tzinfo=dt_tz.utc)
+                api_end = end_dt.replace(tzinfo=dt_tz.utc)
 
             # Query events
             events_result = (
                 context.calendar_service.events()
                 .list(
                     calendarId=calendar_id,
-                    timeMin=format_datetime_for_api(start_dt),
-                    timeMax=format_datetime_for_api(end_dt),
+                    timeMin=api_start.isoformat(),
+                    timeMax=api_end.isoformat(),
                     maxResults=max_results,
                     singleEvents=True,
                     orderBy="startTime",
@@ -288,8 +397,8 @@ class UpdateEventTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Update an existing calendar event. You can specify the event by ID, "
-            "or by title (and optionally date) to look it up from recently fetched events. "
+            "Update an existing calendar event. PREFERRED: use event_id from list_events output. "
+            "Alternatively, provide event_title for fuzzy search. "
             "Can update title, date, time, duration, location, or description."
         )
 
@@ -299,19 +408,19 @@ class UpdateEventTool(Tool):
             ToolParameter(
                 name="event_id",
                 type="string",
-                description="The event ID to update (optional if event_title provided)",
+                description="The event ID (from list_events output). PREFERRED method - most reliable.",
                 required=False,
             ),
             ToolParameter(
                 name="event_title",
                 type="string",
-                description="Title of the event to find and update (used if event_id not provided)",
+                description="Title of the event to find (fallback if event_id not available). Searches via API.",
                 required=False,
             ),
             ToolParameter(
                 name="event_date",
                 type="string",
-                description="Date of the event to find (helps narrow down search when using event_title)",
+                description="Date to narrow title search (e.g. 'today', '2025-01-24')",
                 required=False,
             ),
             ToolParameter(
@@ -363,41 +472,25 @@ class UpdateEventTool(Tool):
         event_title = kwargs.get("event_title")
         event_date_str = kwargs.get("event_date")
         calendar_id = kwargs.get("calendar_id", "primary")
+        tz = context.config.timezone if context.config else "UTC"
 
-        # Try to resolve event_id from cache if not provided
-        if not event_id and event_title and context.calendar_cache:
-            search_date = None
-            if event_date_str:
-                try:
-                    search_date = parse_datetime(event_date_str)
-                except ValueError:
-                    pass
+        if not context.calendar_service:
+            return "Error: Google Calendar service not available."
 
-            cached_event = context.calendar_cache.find_best_match(
-                title=event_title,
-                date=search_date,
+        # Resolve event_id by searching the API if not provided
+        if not event_id and event_title:
+            event_id = await _find_event_by_title(
+                context, event_title, event_date_str, calendar_id, tz
             )
-
-            if cached_event:
-                event_id = cached_event.event_id
-                logger.info(
-                    f"[UpdateEvent] Found event '{cached_event.summary}' "
-                    f"(id: {event_id[:8]}...) from cache"
-                )
-            else:
-                # Show what's in cache to help user
-                cache_summary = context.calendar_cache.get_cache_summary()
+            if not event_id:
                 return (
-                    f"Could not find event matching '{event_title}' in cache. "
-                    f"{cache_summary}\n\n"
-                    f"Try using list_events first to fetch events, or provide the exact event_id."
+                    f"Could not find event matching '{event_title}'. "
+                    f"Use list_events first to see available events with their event_id, "
+                    f"then call update_event with the exact event_id."
                 )
 
         if not event_id:
             return "Error: Please provide either event_id or event_title to identify the event."
-
-        if not context.calendar_service:
-            return "Error: Google Calendar service not available."
 
         try:
             # Get the existing event
@@ -433,14 +526,14 @@ class UpdateEventTool(Tool):
                 new_time = kwargs.get("time")
 
                 if new_date and new_time:
-                    new_start = parse_datetime(new_date, new_time)
+                    new_start = parse_datetime(new_date, new_time, timezone=tz)
                 elif new_date:
-                    new_start = parse_datetime(new_date)
+                    new_start = parse_datetime(new_date, timezone=tz)
                     new_start = new_start.replace(
                         hour=existing_dt.hour, minute=existing_dt.minute
                     )
                 else:
-                    new_start = parse_datetime("today", new_time)
+                    new_start = parse_datetime("today", new_time, timezone=tz)
                     new_start = new_start.replace(
                         year=existing_dt.year,
                         month=existing_dt.month,
@@ -463,14 +556,13 @@ class UpdateEventTool(Tool):
 
                 new_end = new_start + duration
 
-                timezone = context.config.timezone if context.config else "UTC"
                 event["start"] = {
-                    "dateTime": format_datetime_for_api(new_start),
-                    "timeZone": timezone,
+                    "dateTime": format_datetime_for_api(new_start, timezone=tz),
+                    "timeZone": tz,
                 }
                 event["end"] = {
-                    "dateTime": format_datetime_for_api(new_end),
-                    "timeZone": timezone,
+                    "dateTime": format_datetime_for_api(new_end, timezone=tz),
+                    "timeZone": tz,
                 }
 
             # Update the event
@@ -535,40 +627,25 @@ class DeleteEventTool(Tool):
         event_title = kwargs.get("event_title")
         event_date_str = kwargs.get("event_date")
         calendar_id = kwargs.get("calendar_id", "primary")
+        tz = context.config.timezone if context.config else "UTC"
 
-        # Try to resolve event_id from cache if not provided
-        if not event_id and event_title and context.calendar_cache:
-            search_date = None
-            if event_date_str:
-                try:
-                    search_date = parse_datetime(event_date_str)
-                except ValueError:
-                    pass
+        if not context.calendar_service:
+            return "Error: Google Calendar service not available."
 
-            cached_event = context.calendar_cache.find_best_match(
-                title=event_title,
-                date=search_date,
+        # Resolve event_id by searching the API if not provided
+        if not event_id and event_title:
+            event_id = await _find_event_by_title(
+                context, event_title, event_date_str, calendar_id, tz
             )
-
-            if cached_event:
-                event_id = cached_event.event_id
-                logger.info(
-                    f"[DeleteEvent] Found event '{cached_event.summary}' "
-                    f"(id: {event_id[:8]}...) from cache"
-                )
-            else:
-                cache_summary = context.calendar_cache.get_cache_summary()
+            if not event_id:
                 return (
-                    f"Could not find event matching '{event_title}' in cache. "
-                    f"{cache_summary}\n\n"
-                    f"Try using list_events first to fetch events, or provide the exact event_id."
+                    f"Could not find event matching '{event_title}'. "
+                    f"Use list_events first to see available events with their event_id, "
+                    f"then call delete_event with the exact event_id."
                 )
 
         if not event_id:
             return "Error: Please provide either event_id or event_title to identify the event."
-
-        if not context.calendar_service:
-            return "Error: Google Calendar service not available."
 
         try:
             # Get event details first for confirmation

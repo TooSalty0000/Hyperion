@@ -77,12 +77,14 @@ class FindFreeSlotsTool(Tool):
             start_hour = kwargs.get("start_hour", 9)
             end_hour = kwargs.get("end_hour", 17)
 
+        tz = context.config.timezone if context.config else "UTC"
+
         if not context.calendar_service:
             return "Error: Google Calendar service not available."
 
         try:
             # Parse the target date
-            target_date = parse_datetime(date_str).date()
+            target_date = parse_datetime(date_str, timezone=tz).date()
 
             # Define the search window
             day_start = datetime.combine(target_date, dt_time(start_hour, 0))
@@ -93,8 +95,8 @@ class FindFreeSlotsTool(Tool):
                 context.calendar_service.events()
                 .list(
                     calendarId=calendar_id,
-                    timeMin=format_datetime_for_api(day_start),
-                    timeMax=format_datetime_for_api(day_end),
+                    timeMin=format_datetime_for_api(day_start, timezone=tz),
+                    timeMax=format_datetime_for_api(day_end, timezone=tz),
                     singleEvents=True,
                     orderBy="startTime",
                 )
@@ -216,13 +218,14 @@ class CheckConflictsTool(Tool):
         time_str = kwargs.get("time")
         duration_minutes = kwargs.get("duration_minutes", 60)
         calendar_id = kwargs.get("calendar_id", "primary")
+        tz = context.config.timezone if context.config else "UTC"
 
         if not context.calendar_service:
             return "Error: Google Calendar service not available."
 
         try:
             # Parse the proposed time
-            proposed_start = parse_datetime(date_str, time_str)
+            proposed_start = parse_datetime(date_str, time_str, timezone=tz)
             proposed_end = proposed_start + timedelta(minutes=duration_minutes)
 
             # Search for events in a window around the proposed time
@@ -233,8 +236,8 @@ class CheckConflictsTool(Tool):
                 context.calendar_service.events()
                 .list(
                     calendarId=calendar_id,
-                    timeMin=format_datetime_for_api(window_start),
-                    timeMax=format_datetime_for_api(window_end),
+                    timeMin=format_datetime_for_api(window_start, timezone=tz),
+                    timeMax=format_datetime_for_api(window_end, timezone=tz),
                     singleEvents=True,
                     orderBy="startTime",
                 )

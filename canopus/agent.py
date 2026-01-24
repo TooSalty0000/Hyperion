@@ -698,18 +698,33 @@ When you learn something important about websites or research findings, use stor
             logger.info(f"Canopus loaded {len(history)} messages from Discord history")
             messages.extend(history)
 
-        # Add current user message
-        user_name = f"User {context.user_id}"
-        if self.discord_bot:
-            try:
-                user = await self.discord_bot.fetch_user(context.user_id)
-                user_name = user.display_name or user.name
-            except Exception:
-                pass
+        # Frame the current message based on source
+        if context.is_from_agent:
+            # Dispatch from Vega — frame as authoritative directive
+            messages.append(
+                Message(
+                    role=Role.USER,
+                    content=(
+                        f"[DISPATCH FROM VEGA - THIS IS YOUR TASK]:\n"
+                        f"{context.message_content}\n\n"
+                        f"Do EXACTLY this task. The chat history above is for context only. "
+                        f"Do not infer additional work beyond what is stated here."
+                    ),
+                )
+            )
+        else:
+            # Direct user message
+            user_name = f"User {context.user_id}"
+            if self.discord_bot:
+                try:
+                    user = await self.discord_bot.fetch_user(context.user_id)
+                    user_name = user.display_name or user.name
+                except Exception:
+                    pass
 
-        messages.append(
-            Message(role=Role.USER, content=f"[{user_name}]: {context.message_content}")
-        )
+            messages.append(
+                Message(role=Role.USER, content=f"[{user_name}]: {context.message_content}")
+            )
 
         return messages
 

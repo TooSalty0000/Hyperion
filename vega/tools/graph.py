@@ -134,6 +134,11 @@ class CreatePlanTool(Tool):
         # Dispatch any immediately ready nodes
         dispatched = await executor.dispatch_ready_nodes(graph)
 
+        # Signal that we dispatched to external agents (Vega should yield and wait)
+        has_agent_dispatch = any(n.type == NodeType.DISPATCH for n in dispatched)
+        if has_agent_dispatch:
+            context.dispatched_to_agents = True
+
         ready_count = len(graph.get_ready_nodes())
         dispatch_str = f", {len(dispatched)} dispatched" if dispatched else ""
 
@@ -218,6 +223,11 @@ class AddNodesTool(Tool):
 
         # Dispatch newly ready nodes
         dispatched = await executor.dispatch_ready_nodes(graph)
+
+        # Signal that we dispatched to external agents (Vega should yield and wait)
+        has_agent_dispatch = any(n.type == NodeType.DISPATCH for n in dispatched)
+        if has_agent_dispatch:
+            context.dispatched_to_agents = True
 
         return f"Added {added} nodes to graph {graph_id}. {len(dispatched)} dispatched."
 
@@ -306,6 +316,11 @@ class UpdateNodeTool(Tool):
 
         # Dispatch any newly ready nodes
         dispatched = await executor.dispatch_ready_nodes(graph)
+
+        # Signal that we dispatched to external agents (Vega should yield and wait)
+        has_agent_dispatch = any(n.type == NodeType.DISPATCH for n in dispatched)
+        if has_agent_dispatch:
+            context.dispatched_to_agents = True
 
         # Post node update embed to thread
         await executor._post_node_update_embed(graph, node, status, result)

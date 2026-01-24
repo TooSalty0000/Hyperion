@@ -67,7 +67,7 @@ class AgentMessaging:
         full_message = f"{mention} {message}"
 
         try:
-            sent_message = await channel.send(full_message, **kwargs)
+            sent_message = await channel.send(full_message, silent=True, **kwargs)
             logger.info(f"{self.own_agent_name} mentioned {target_agent}: {message[:50]}...")
             return sent_message
         except Exception as e:
@@ -100,6 +100,7 @@ class AgentMessaging:
             sent_message = await original_message.channel.send(
                 content,
                 reference=original_message,
+                silent=True,
                 **kwargs
             )
             return sent_message

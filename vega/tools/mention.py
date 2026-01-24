@@ -246,7 +246,7 @@ class MentionAgentTool(Tool):
 
         for attempt in range(max_retries + 1):
             try:
-                sent_msg = await channel.send(content)
+                sent_msg = await channel.send(content, silent=True)
                 return sent_msg
 
             except discord.Forbidden as e:

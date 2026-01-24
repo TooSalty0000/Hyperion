@@ -199,7 +199,7 @@ class EventDispatcher:
 
         try:
             message = event.format_for_discord()
-            await channel.send(message)
+            await channel.send(message, silent=True)
         except Exception as e:
             logger.error(f"Failed to send event to Discord: {e}")
 

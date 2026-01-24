@@ -94,6 +94,7 @@ class ScreenshotTool(Tool):
                             await channel.send(
                                 f"📸 Screenshot: {session.current_url}",
                                 file=file,
+                                silent=True,
                             )
                             return f"Screenshot taken and sent to Discord: {filename}"
                     except Exception as e:

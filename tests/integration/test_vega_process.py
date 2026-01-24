@@ -164,6 +164,37 @@ class TestPlanCreation:
         assert "<@111>" in sent_content  # altair
         assert "git status" in sent_content
 
+        # Vega should yield (None content) and NOT invoke LLM a second time
+        assert response.content is None
+        assert len(llm.calls) == 1  # Only 1 LLM call, then yield
+
+    @pytest.mark.asyncio
+    async def test_think_only_plan_does_not_yield(self, context, executor, trigger_msg):
+        """Plans with only THINK nodes should NOT yield — Vega handles them internally."""
+        llm = ScriptedLLM([
+            LLMResponse(tool_calls=[
+                ToolCall(id="tc1", name="create_plan", arguments={
+                    "goal": "just think",
+                    "nodes": [
+                        {"id": "t1", "type": "think", "description": "ponder"},
+                    ]
+                })
+            ]),
+            # Vega should continue to iteration 2 (think nodes are internal)
+            LLMResponse(tool_calls=[
+                ToolCall(id="tc2", name="respond_to_user", arguments={
+                    "message": "I pondered and here's the answer.",
+                    "graph_id": "__FILL__",
+                }),
+            ]),
+        ])
+        agent = make_vega(llm)
+        response = await agent.process(context, job_executor=executor, trigger_message=trigger_msg)
+
+        # Should NOT yield — should continue and respond
+        assert response.content == "I pondered and here's the answer."
+        assert len(llm.calls) == 2  # Both iterations ran
+
 
 # --------------------------------------------------
 # respond_to_user Short-Circuit

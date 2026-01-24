@@ -453,6 +453,7 @@ class AltairCore(commands.Cog, AgentAcknowledgmentMixin):
             guild_id=message.guild.id if message.guild else None,
             mentioned_agent="altair",
             conversation_id=conversation_id,
+            is_from_agent=is_from_agent,
         )
 
         # Add to queue for sequential processing
@@ -530,11 +531,11 @@ class AltairCore(commands.Cog, AgentAcknowledgmentMixin):
                 logger.warning(f"[Altair] Failed to send completion reaction: {e}")
 
     async def _send_response(self, channel: discord.TextChannel, content: str):
-        """Send a response, splitting if necessary."""
+        """Send a response, splitting if necessary. Sent silently (no push notification)."""
         max_length = 1900
 
         if len(content) <= max_length:
-            await channel.send(content)
+            await channel.send(content, silent=True)
             return
 
         # Split into chunks
@@ -556,7 +557,7 @@ class AltairCore(commands.Cog, AgentAcknowledgmentMixin):
             content = content[split_at:]
 
         for chunk in chunks:
-            await channel.send(chunk)
+            await channel.send(chunk, silent=True)
 
     @commands.Cog.listener()
     async def on_reaction_add(self, reaction: discord.Reaction, user: discord.User):

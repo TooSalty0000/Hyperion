@@ -486,7 +486,7 @@ class MarkGoalCompleteTool(Tool):
                 f"`[from: canopus]`"
             )
 
-            await channel.send(handoff_message)
+            await channel.send(handoff_message, silent=True)
             logger.info(f"[Canopus] Sent handoff to {agent_name}")
             return f"📤 Handed off to @{agent_name}"
 

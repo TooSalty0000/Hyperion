@@ -48,6 +48,10 @@ class ToolContext:
     # Response message (set by RespondToUserTool, read by cog)
     response_message: Optional[str] = None
 
+    # Set by graph tools when DISPATCH nodes are sent to agents.
+    # Signals Vega's process loop to yield and wait for agent responses.
+    dispatched_to_agents: bool = False
+
     def with_session(self, session_id: int) -> 'ToolContext':
         """Create a new context with updated session ID."""
         return ToolContext(
