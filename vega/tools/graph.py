@@ -400,8 +400,9 @@ class RespondToUserTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Send a final response to the user in the main channel (not the thread). "
-            "Use this when you've gathered enough information to answer the user's request."
+            "Send a FINAL response to the user and END the graph. This terminates all processing. "
+            "ONLY use this when the user's request is fully complete and no more agent work is needed. "
+            "Do NOT use this to ask agents questions - use add_nodes with a dispatch node instead."
         )
 
     @property
@@ -421,26 +422,44 @@ class RespondToUserTool(Tool):
             ),
         ]
 
-    async def execute(self, context: ToolContext, message: str, graph_id: str = None) -> str:
+    async def execute(self, context: ToolContext, message: str = "", graph_id: str = None) -> str:
         """Send response to user."""
+        # Validate message
+        if not message:
+            return "Error: 'message' parameter is required and must be a non-empty string."
+
         executor = context.job_executor
+
+        # Set response_message for cog to send
+        context.response_message = message
+
         if not executor:
-            return "Error: Job executor not available."
+            # Still deliver the response even without executor
+            return f"Response queued (no executor). ({len(message)} chars)."
 
         # Find the graph and complete it
         if graph_id:
+            graph_found = False
             for g in executor.get_all_active_graphs():
                 if g.id == graph_id:
+                    graph_found = True
                     # Mark any respond nodes as completed
                     for node in g.nodes.values():
                         if node.type == NodeType.RESPOND and node.status == NodeStatus.RUNNING:
                             g.mark_completed(node.id, message[:200])
                     # Complete the graph (posts embed + deletes thread)
-                    await executor.complete_graph(g)
+                    try:
+                        await executor.complete_graph(g)
+                    except Exception as e:
+                        logger.warning(f"[RespondToUser] Graph cleanup failed: {e}")
                     break
 
-        # The actual sending is handled by the cog after process() returns
-        context.response_message = message
+            if not graph_found:
+                logger.info(
+                    f"[RespondToUser] Graph '{graph_id}' not found in active graphs "
+                    f"(may already be completed)"
+                )
+
         return f"Response queued for delivery to user ({len(message)} chars)."
 
 

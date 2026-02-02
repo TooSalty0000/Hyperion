@@ -1,6 +1,7 @@
 """Tool registry for managing and executing tools."""
 
 import logging
+import time
 from typing import Dict, List, Optional, Callable, Awaitable
 
 from shared.llm.types import ToolDefinition, ToolCall, ToolResult
@@ -93,9 +94,15 @@ class ToolRegistry:
             )
 
         try:
+            start_time = time.time()
             logger.info(f"Executing tool: {call.name} with args: {call.arguments}")
             result = await tool.execute(context, **call.arguments)
-            logger.debug(f"Tool {call.name} result: {result[:200]}...")
+            exec_time = (time.time() - start_time) * 1000
+
+            logger.debug(
+                f"[Tool] ✓ {call.name}: {exec_time:.0f}ms, "
+                f"result_len={len(result) if result else 0}"
+            )
             return ToolResult(
                 call_id=call.id,
                 name=call.name,

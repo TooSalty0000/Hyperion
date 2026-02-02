@@ -53,6 +53,11 @@ class PolarisBot(commands.Bot):
         logger.info(f"Polaris connected as {self.user} (ID: {self.user.id})")
         logger.info(f"Connected to {len(self.guilds)} guild(s)")
 
+        # Populate member cache from all guilds
+        from shared.discord_utils import get_member_cache
+        cache = get_member_cache()
+        cache.populate_from_guilds(self.guilds)
+
         # Check calendar authentication status
         await self._check_calendar_status()
 

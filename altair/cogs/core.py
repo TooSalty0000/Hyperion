@@ -10,6 +10,7 @@ from discord.ext import commands, tasks
 
 from shared.base_agent import AgentContext
 from shared.agent_messaging import AgentMessaging
+from shared.discord_utils import convert_text_mentions_to_discord
 from shared.agent_queue import AgentMessageQueue
 from shared.channel import ChannelManager
 from shared.database import InMemorySessionStore, FileSessionStore
@@ -74,6 +75,7 @@ class AltairCore(commands.Cog, AgentAcknowledgmentMixin):
         self.project_manager = None
         self.memory_manager = None
         self.conversation_manager = None
+        self.soul_manager = None
 
         # Track per-session state for output loops
         self._output_tasks: dict = {}
@@ -177,10 +179,20 @@ class AltairCore(commands.Cog, AgentAcknowledgmentMixin):
                 from shared.project import ProjectManager
                 from shared.memory import MemoryManager
                 from shared.conversation import ConversationManager
+                from shared.soul import SoulManager, get_default_traits
                 self.project_manager = ProjectManager(self.config.redis_url)
                 self.memory_manager = MemoryManager(self.config.redis_url)
                 self.conversation_manager = ConversationManager(self.config.redis_url)
-                logger.info("Project, memory, and conversation managers initialized")
+                self.soul_manager = SoulManager(self.config.redis_url)
+                logger.info("Project, memory, conversation, and soul managers initialized")
+
+                # Initialize default soul traits for Altair if not already present
+                import asyncio
+                asyncio.create_task(
+                    self.soul_manager.ensure_defaults_initialized(
+                        "altair", get_default_traits("altair")
+                    )
+                )
             except Exception as e:
                 logger.warning(f"Failed to initialize Redis-backed managers: {e}")
 
@@ -201,6 +213,7 @@ class AltairCore(commands.Cog, AgentAcknowledgmentMixin):
             session_registry=self.session_registry,
             project_manager=self.project_manager,
             memory_manager=self.memory_manager,
+            soul_manager=self.soul_manager,
             discord_bot=self.bot,
             channel_manager=self.channel_manager,
             agent_registry=self.config.agent_registry.agents,
@@ -414,6 +427,18 @@ class AltairCore(commands.Cog, AgentAcknowledgmentMixin):
             )
             return
 
+        # Pre-enqueue check: Should we respond at all?
+        # Skip for agent dispatches (always respond to tasks)
+        # Check for casual mentions that don't need a response
+        if not is_from_agent:
+            should_respond = await self._should_respond_to_mention(message, clean_content)
+            if not should_respond:
+                logger.info(
+                    f"[Altair] SKIPPING casual mention: '{clean_content[:50]}...' - "
+                    f"utility LLM decided no response needed"
+                )
+                return
+
         # Log who we received message from
         if is_from_agent:
             sender_agent = self.agent_messaging.is_from_agent(message)
@@ -494,6 +519,9 @@ class AltairCore(commands.Cog, AgentAcknowledgmentMixin):
             f"content={context.message_content[:50]}..."
         )
 
+        # Record when we started processing for stale check
+        processing_started = message.created_at
+
         # Show typing indicator while processing
         async with message.channel.typing():
             response = await self.agent.process(context)
@@ -501,14 +529,34 @@ class AltairCore(commands.Cog, AgentAcknowledgmentMixin):
         # Track completed task for workflow continuity
         self.workflow_state_provider.on_task_completed(context.message_content)
 
-        # Send response only if there's content
+        # Check if response is just noise (acknowledgments, etc.)
+        if response.content and self._is_noise_response(response.content):
+            logger.info(
+                f"[Altair] SUPPRESSING NOISE RESPONSE: msg_id={message.id}, "
+                f"content='{response.content[:50]}'"
+            )
+            response.content = ""  # Clear the noise
+
+        # Check if our response is stale (conversation moved on while we were processing)
+        should_send = True
         if response.content:
+            should_send = await self._check_response_freshness(
+                message.channel, processing_started, message.id, is_from_agent
+            )
+
+        # Send response only if there's content AND response is still relevant
+        if response.content and should_send:
             logger.info(
                 f"[Altair] SENDING RESPONSE: msg_id={message.id}, "
                 f"response_len={len(response.content)}, tool_calls={response.tool_calls_made}, "
                 f"content_preview={response.content[:100]}..."
             )
             await self._send_response(message.channel, response.content)
+        elif response.content and not should_send:
+            logger.info(
+                f"[Altair] SUPPRESSING STALE RESPONSE: msg_id={message.id}, "
+                f"conversation moved on while processing"
+            )
         else:
             logger.info(
                 f"[Altair] NO RESPONSE CONTENT: msg_id={message.id}, "
@@ -530,9 +578,219 @@ class AltairCore(commands.Cog, AgentAcknowledgmentMixin):
             except Exception as e:
                 logger.warning(f"[Altair] Failed to send completion reaction: {e}")
 
+    async def _check_response_freshness(
+        self,
+        channel: discord.TextChannel,
+        since: any,
+        original_msg_id: int,
+        is_from_agent: bool,
+    ) -> bool:
+        """
+        Check if our response is still relevant or if the conversation has moved on.
+
+        Returns True if we should send the response, False if it's stale.
+        """
+        try:
+            # Count new messages since we started processing
+            new_message_count = 0
+            user_messages = 0
+            agent_messages = 0
+
+            async for msg in channel.history(limit=15, after=since):
+                # Skip our trigger message
+                if msg.id == original_msg_id:
+                    continue
+                # Skip empty messages
+                if not msg.content or not msg.content.strip():
+                    continue
+
+                new_message_count += 1
+
+                if msg.author.bot:
+                    agent_messages += 1
+                else:
+                    user_messages += 1
+
+            # Decision logic:
+            # - If user sent 2+ new messages, conversation likely moved on
+            # - If 3+ agent messages came in, conversation is very active
+            # - If from an agent (dispatch), we should always respond (it's a task)
+            if is_from_agent:
+                # Always respond to dispatches, but log if conversation is busy
+                if new_message_count > 5:
+                    logger.info(
+                        f"[Altair] Conversation busy ({new_message_count} new msgs) "
+                        f"but responding to agent dispatch"
+                    )
+                return True
+
+            if user_messages >= 2:
+                logger.info(
+                    f"[Altair] Response stale: {user_messages} user messages since we started"
+                )
+                return False
+
+            if agent_messages >= 3:
+                logger.info(
+                    f"[Altair] Response stale: {agent_messages} agent messages since we started"
+                )
+                return False
+
+            return True
+
+        except Exception as e:
+            logger.warning(f"[Altair] Freshness check failed: {e}")
+            # On error, default to sending the response
+            return True
+
+    async def _should_respond_to_mention(
+        self,
+        message: discord.Message,
+        clean_content: str,
+    ) -> bool:
+        """
+        Use utility LLM to quickly decide if we should respond to this mention.
+
+        Returns False for casual mentions, greetings, or when we're just being
+        discussed rather than asked to do something.
+        """
+        # Quick pattern checks for obvious cases (save LLM call)
+        content_lower = clean_content.lower().strip()
+
+        # Always respond to direct questions or commands
+        if any(word in content_lower for word in [
+            "please", "can you", "could you", "would you", "help me",
+            "run", "execute", "start", "create", "check", "look at",
+            "what is", "how do", "why", "show me", "tell me",
+        ]):
+            return True
+
+        # Check if utility LLM is available
+        if not self.agent or not self.agent.utility_llm:
+            # No utility LLM, default to responding
+            return True
+
+        # Gather recent context
+        recent_context = []
+        try:
+            async for msg in message.channel.history(limit=5, before=message):
+                if msg.content:
+                    author = msg.author.display_name
+                    recent_context.append(f"[{author}]: {msg.content[:100]}")
+            recent_context.reverse()
+        except Exception:
+            pass
+
+        context_str = "\n".join(recent_context[-3:]) if recent_context else "(no recent messages)"
+
+        # Quick LLM evaluation
+        from shared.llm.types import Message, Role
+        prompt = f"""You are deciding whether an AI agent named Altair should respond to a Discord message.
+
+Altair is a CLI/terminal specialist. He should ONLY respond when:
+- Someone is asking him specifically to do something (run commands, check files, etc.)
+- Someone is asking him a direct question
+- He is being assigned a task
+
+Altair should NOT respond when:
+- People are just chatting casually and happened to mention him
+- It's a general greeting to everyone (like "hi everyone" or "hello team")
+- Others are discussing him but not talking TO him
+- Another agent already handled the request
+- It's just social pleasantries or acknowledgments
+
+Recent conversation:
+{context_str}
+
+Message that mentioned Altair:
+[{message.author.display_name}]: {clean_content}
+
+Should Altair respond to this message? Answer only YES or NO."""
+
+        try:
+            response = await self.agent.utility_llm.generate(
+                messages=[Message(role=Role.USER, content=prompt)],
+                temperature=0.0,
+                max_tokens=10,
+            )
+
+            answer = response.content.strip().upper() if response.content else "YES"
+            should_respond = "YES" in answer
+
+            if not should_respond:
+                logger.info(
+                    f"[Altair] Utility LLM says NO RESPONSE needed for: "
+                    f"'{clean_content[:40]}...'"
+                )
+
+            return should_respond
+
+        except Exception as e:
+            logger.warning(f"[Altair] Utility LLM check failed: {e}")
+            # On error, default to responding
+            return True
+
+    def _is_noise_response(self, content: str) -> bool:
+        """
+        Check if a response is just noise (acknowledgments, short phrases).
+        Returns True if the response should be suppressed.
+        """
+        if not content:
+            return False
+
+        # Normalize
+        normalized = content.strip().lower()
+
+        # Remove punctuation for comparison
+        import re
+        clean = re.sub(r'[^\w\s]', '', normalized)
+
+        # Exact match noise phrases
+        noise_phrases = {
+            "done", "task completed", "acknowledged", "understood",
+            "copy that", "ready", "got it", "noted", "roger",
+            "affirmative", "on it", "will do", "ok", "okay",
+            "yes", "yep", "yup", "sure", "alright", "confirmed",
+            "received", "standing by", "waiting", "listening",
+            "bouncer protocol integrated", "bouncer protocol active",
+            "protocol acknowledged", "protocol integrated",
+            "web operation completed", "operation completed",
+            "task done", "completed", "finished", "task finished",
+        }
+
+        if clean in noise_phrases:
+            return True
+
+        # Check if response is very short (likely noise)
+        # But only if it doesn't contain meaningful content
+        if len(clean.split()) <= 3:
+            # Check for common noise patterns
+            noise_patterns = [
+                r"^(done|ok|okay|yes|no|sure|ready|got it|noted)\.?$",
+                r"^task (completed|done|finished)\.?$",
+                r"^(acknowledged|understood|copy that|roger)\.?$",
+                r"^(web )?operation (completed|done)\.?$",
+                r"^(standing by|waiting|ready)\.?$",
+                r"^(affirmative|confirmed|received)\.?$",
+                r"^protocol (integrated|acknowledged|active)\.?$",
+                r"^bouncer protocol.*$",
+            ]
+            for pattern in noise_patterns:
+                if re.match(pattern, normalized):
+                    return True
+
+        return False
+
     async def _send_response(self, channel: discord.TextChannel, content: str):
         """Send a response, splitting if necessary. Sent silently (no push notification)."""
         max_length = 1900
+
+        # Convert @Name text to actual Discord mentions
+        content = await convert_text_mentions_to_discord(
+            content,
+            channel,
+            self.config.agent_registry.agents,
+        )
 
         if len(content) <= max_length:
             await channel.send(content, silent=True)

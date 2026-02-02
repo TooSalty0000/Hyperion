@@ -175,3 +175,173 @@ def is_from_known_agent(
         if msg.author.id == uid:
             return name
     return None
+
+
+class MemberCache:
+    """
+    Cache of Discord guild members for fast @mention lookups.
+
+    Initialized at bot startup and can be refreshed dynamically.
+    """
+
+    def __init__(self):
+        # name (lowercase) -> user_id
+        self._by_name: dict[str, int] = {}
+        # user_id -> display_name (for reverse lookups)
+        self._by_id: dict[int, str] = {}
+        self._initialized = False
+
+    def populate_from_guilds(self, guilds):
+        """Populate cache from all bot guilds. Call this in on_ready."""
+        count = 0
+        for guild in guilds:
+            for member in guild.members:
+                self._add_member(member)
+                count += 1
+        self._initialized = True
+        logger.info(f"[MemberCache] Populated with {count} members from {len(list(guilds))} guilds")
+
+    def _add_member(self, member: discord.Member):
+        """Add a single member to the cache."""
+        # Index by display name and username (both lowercase)
+        self._by_name[member.display_name.lower()] = member.id
+        self._by_name[member.name.lower()] = member.id
+        self._by_id[member.id] = member.display_name
+
+    def add_member(self, member: discord.Member):
+        """Public method to add a member (e.g., when a new member joins)."""
+        self._add_member(member)
+        logger.debug(f"[MemberCache] Added member: {member.display_name} ({member.id})")
+
+    def get_user_id(self, name: str) -> Optional[int]:
+        """Look up user ID by name (case-insensitive)."""
+        return self._by_name.get(name.lower())
+
+    def get_display_name(self, user_id: int) -> Optional[str]:
+        """Look up display name by user ID."""
+        return self._by_id.get(user_id)
+
+    @property
+    def member_count(self) -> int:
+        """Number of unique members in cache."""
+        return len(self._by_id)
+
+    @property
+    def is_initialized(self) -> bool:
+        return self._initialized
+
+
+# Global member cache - shared across all cogs
+_member_cache: Optional[MemberCache] = None
+
+
+def get_member_cache() -> MemberCache:
+    """Get the global member cache (creates one if needed)."""
+    global _member_cache
+    if _member_cache is None:
+        _member_cache = MemberCache()
+    return _member_cache
+
+
+async def convert_text_mentions_to_discord(
+    content: str,
+    channel: discord.abc.Messageable,
+    agent_registry: dict[str, int],
+) -> str:
+    """
+    Convert @Name text patterns to actual Discord mentions.
+
+    Searches for patterns like `@Sirius`, `@Vega`, or `@Username` and converts
+    them to Discord mention format `<@user_id>` if the name matches:
+    1. The global member cache (populated at startup from all guilds)
+    2. A known agent in the registry (fallback)
+    3. Live guild member lookup (if not in cache)
+
+    Args:
+        content: Message content to process
+        channel: Discord channel (used for live lookups if cache miss)
+        agent_registry: Mapping of agent names to Discord user IDs (fallback)
+
+    Returns:
+        Content with @Name patterns replaced with Discord mentions
+    """
+    if not content or "@" not in content:
+        return content
+
+    cache = get_member_cache()
+
+    # Build case-insensitive agent lookup as fallback
+    agent_lookup = {name.lower(): uid for name, uid in agent_registry.items()}
+
+    logger.info(
+        f"[MentionConvert] Processing: cache={cache.member_count} members, "
+        f"agents={list(agent_lookup.keys())}, content='{content[:60]}...'"
+    )
+
+    # Get guild for live lookups if cache misses
+    guild = getattr(channel, 'guild', None) if hasattr(channel, 'guild') else None
+
+    # Pattern to find @Name (word characters after @, not already a Discord mention)
+    pattern = re.compile(r'(?<![<\w])@(\w+)(?!>)')
+
+    # We need async lookup, so collect matches first
+    matches = list(pattern.finditer(content))
+    if not matches:
+        return content
+
+    # Process matches in reverse order to preserve string positions
+    result = content
+    for match in reversed(matches):
+        name = match.group(1)
+        name_lower = name.lower()
+        user_id = None
+        source = None
+
+        # 1. Check member cache first (fastest)
+        user_id = cache.get_user_id(name_lower)
+        if user_id:
+            source = "cache"
+
+        # 2. Check agent registry (fallback for bots)
+        if not user_id and name_lower in agent_lookup:
+            user_id = agent_lookup[name_lower]
+            source = "agent"
+
+        # 3. Try live guild member search (updates cache)
+        if not user_id and guild:
+            # Search by name
+            member = guild.get_member_named(name)
+            if not member:
+                # Try case-insensitive search
+                for m in guild.members:
+                    if m.display_name.lower() == name_lower or m.name.lower() == name_lower:
+                        member = m
+                        break
+
+            if member:
+                user_id = member.id
+                source = "guild"
+                # Update cache for next time
+                cache.add_member(member)
+
+        # 4. Try fetching by query (last resort - API call)
+        if not user_id and guild:
+            try:
+                members = await guild.query_members(query=name, limit=5)
+                for m in members:
+                    if m.display_name.lower() == name_lower or m.name.lower() == name_lower:
+                        user_id = m.id
+                        source = "query"
+                        cache.add_member(m)
+                        break
+            except Exception as e:
+                logger.debug(f"[MentionConvert] query_members failed: {e}")
+
+        # Replace if found
+        if user_id:
+            logger.info(f"[MentionConvert] ✓ @{name} -> <@{user_id}> ({source})")
+            result = result[:match.start()] + f"<@{user_id}>" + result[match.end():]
+        else:
+            logger.warning(f"[MentionConvert] ✗ @{name} not found")
+
+    return result

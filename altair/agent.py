@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from shared.project import ProjectManager
     from shared.conversation import ConversationManager
     from shared.memory import MemoryManager
+    from shared.soul import SoulManager
     from shared.project.status import ProjectStatusTracker
     from shared.tools.interface import ToolContext
 
@@ -215,6 +216,45 @@ IF YOU RECEIVE A WRONG TASK:
 - OR mention @Vega to delegate: "That's more of a conversation question - @Vega can help with that"
 - You are the HANDS-ON agent - Vega is the CONVERSATIONAL agent
 - Don't refuse to help - either answer briefly or delegate to the right agent
+
+WHEN TO NOT REPLY (CRITICAL - READ CAREFULLY):
+Sometimes the best response is NO response. Do NOT reply when:
+- The message is casual chat between others (e.g., "hi everyone", "thanks!", "lol")
+- Another agent has ALREADY handled the request adequately
+- The conversation has clearly moved on to a different topic
+- You're only tangentially mentioned in a general greeting
+- The message is just social pleasantries not requiring your expertise
+- Someone is asking another agent a question (not you)
+- Someone is giving you INSTRUCTIONS or GUIDELINES (not a task)
+- Vega is telling agents what to do/not do - that's a directive, not a task
+
+If you're uncertain whether to reply, consider:
+1. Was I directly asked to DO something specific with a concrete deliverable?
+2. Does this require my CLI/project expertise to produce something?
+3. Has someone else already addressed this?
+4. Would my response add VALUE or just add NOISE?
+
+=== HOW TO NOT REPLY (THIS IS CRUCIAL) ===
+When you decide NOT to reply, you must produce LITERALLY EMPTY OUTPUT.
+That means: NO TEXT AT ALL. Not even a single character.
+
+FORBIDDEN RESPONSES (NEVER SAY THESE):
+- "Done." / "Done" / "Done!"
+- "Task completed." / "Task completed"
+- "Acknowledged." / "Acknowledged"
+- "Understood." / "Understood"
+- "Copy that." / "Copy that"
+- "Ready." / "Ready"
+- "Got it." / "Got it"
+- "Noted." / "Noted"
+- "Roger." / "Roger"
+- "Affirmative." / "Affirmative"
+- "On it." / "On it"
+- "Will do." / "Will do"
+- Any single-word or short acknowledgment
+
+These are NOISE. They trigger other agents and create feedback loops.
+If you don't have real work to report, say NOTHING. Literal silence.
 """
 
 
@@ -276,6 +316,7 @@ class AltairAgent(BaseAgent):
         project_manager: Optional["ProjectManager"] = None,
         conversation_manager: Optional["ConversationManager"] = None,
         memory_manager: Optional["MemoryManager"] = None,
+        soul_manager: Optional["SoulManager"] = None,
         status_tracker: Optional["ProjectStatusTracker"] = None,
         discord_bot: Optional[Any] = None,
         channel_manager: Optional[Any] = None,
@@ -287,6 +328,7 @@ class AltairAgent(BaseAgent):
             persona=ALTAIR_PERSONA,
             llm=llm,
             memory_manager=memory_manager,
+            soul_manager=soul_manager,
             utility_llm=utility_llm,
         )
         self.session_registry = session_registry
@@ -296,6 +338,9 @@ class AltairAgent(BaseAgent):
         self.discord_bot = discord_bot
         self.channel_manager = channel_manager
         self.agent_registry = agent_registry or {}
+
+        # Force early tool registration (avoid lazy loading during process())
+        _ = self.tools
 
         # Track current working context
         self._current_session_id: Optional[int] = None
@@ -437,12 +482,26 @@ class AltairAgent(BaseAgent):
         else:
             logger.info("Memory manager not configured - memory tools unavailable")
 
-    def get_system_prompt(self, memory_context: Optional[str] = None) -> str:
+        # Register soul tools if soul manager is available
+        if self.soul_manager:
+            from shared.soul.tools import get_soul_tools
+            for tool in get_soul_tools(self.soul_manager):
+                self._tools.register(tool)
+            logger.info("Registered soul tools for Altair")
+        else:
+            logger.info("Soul manager not configured - soul tools unavailable")
+
+    def get_system_prompt(
+        self,
+        memory_context: Optional[str] = None,
+        soul_context: Optional[str] = None,
+    ) -> str:
         """
-        Build Altair's system prompt with optional memory context.
+        Build Altair's system prompt with optional memory and soul context.
 
         Args:
             memory_context: Pre-built memory context string to include
+            soul_context: Pre-built soul context string (injected before memory)
         """
         tools_desc = self.get_tools_description()
 
@@ -468,10 +527,20 @@ sending commands. Monitor output after commands to verify completion."""
         if workflow_state:
             base_prompt += workflow_state.format_for_llm()
 
+        # Soul context comes BEFORE memory (who you are > what you know)
+        if soul_context:
+            base_prompt += f"""
+
+## YOUR SOUL (Who You Are):
+{soul_context}
+
+Your personality evolves through experience. Use introspect_soul to reflect on yourself.
+Use assess_skill after task outcomes to calibrate your confidence."""
+
         if memory_context:
             base_prompt += f"""
 
-## YOUR MEMORIES:
+## YOUR MEMORIES (What You Know):
 {memory_context}
 
 When you learn something important about projects, workflows, or technical details, use store_memory to remember it.
@@ -532,11 +601,14 @@ When you need to recall past information, check your active context above or use
         seen_message_ids: set[int] = set()  # Track messages we've already processed
 
         try:
-            # Build memory context
+            # Build soul context (who you are - injected first)
+            soul_context_str = await self.build_soul_context()
+
+            # Build memory context (what you know)
             memory_context_str = await self.build_memory_context(context.message_content)
 
-            # Build conversation for LLM with memory context
-            messages = await self._build_messages(context, memory_context_str)
+            # Build conversation for LLM with soul and memory context
+            messages = await self._build_messages(context, memory_context_str, soul_context_str)
 
             # Get tool definitions
             tool_defs = self.tools.get_definitions()
@@ -752,11 +824,14 @@ When you need to recall past information, check your active context above or use
             )
 
     async def _build_messages(
-        self, context: AgentContext, memory_context: Optional[str] = None
+        self,
+        context: AgentContext,
+        memory_context: Optional[str] = None,
+        soul_context: Optional[str] = None,
     ) -> List[Message]:
         """Build message history for LLM."""
-        # Use memory-enhanced system prompt if memory context is available
-        system_prompt = self.get_system_prompt(memory_context)
+        # Use soul and memory-enhanced system prompt
+        system_prompt = self.get_system_prompt(memory_context, soul_context)
         messages = [Message(role=Role.SYSTEM, content=system_prompt)]
 
         # Fetch recent Discord channel history for conversation context

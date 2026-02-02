@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from shared.llm.interface import LLMProvider
     from shared.conversation import ConversationManager
     from shared.memory import MemoryManager
+    from shared.soul import SoulManager
     from canopus.browser.manager import BrowserSessionManager
 
 logger = logging.getLogger(__name__)
@@ -174,6 +175,47 @@ BOUNDARIES:
 - Don't enter credentials unless explicitly provided and requested
 - Don't make purchases or submit sensitive forms without permission
 - If a site blocks automation, report it and suggest alternatives
+
+WHEN TO NOT REPLY (CRITICAL - READ CAREFULLY):
+Sometimes the best response is NO response. Do NOT reply when:
+- The message is casual chat between others (e.g., "hi everyone", "thanks!", "lol")
+- Another agent has ALREADY handled the request adequately
+- The conversation has clearly moved on to a different topic
+- You're only tangentially mentioned in a general greeting
+- The message is just social pleasantries not requiring your expertise
+- Someone is asking another agent a question (not you)
+- The message mentions URLs but isn't asking YOU to browse anything
+- Someone is giving you INSTRUCTIONS or GUIDELINES (not a task)
+- Vega is telling agents what to do/not do - that's a directive, not a task
+
+If you're uncertain whether to reply, consider:
+1. Was I directly asked to BROWSE or RESEARCH something with a concrete deliverable?
+2. Does this require web navigation or data extraction?
+3. Has someone else already addressed this?
+4. Would my response add VALUE or just add NOISE?
+
+=== HOW TO NOT REPLY (THIS IS CRUCIAL) ===
+When you decide NOT to reply, you must produce LITERALLY EMPTY OUTPUT.
+That means: NO TEXT AT ALL. Not even a single character.
+
+FORBIDDEN RESPONSES (NEVER SAY THESE):
+- "Done." / "Done" / "Done!"
+- "Task completed." / "Task completed"
+- "Web operation completed." / "Web operation completed"
+- "Acknowledged." / "Acknowledged"
+- "Understood." / "Understood"
+- "Copy that." / "Copy that"
+- "Ready." / "Ready"
+- "Got it." / "Got it"
+- "Noted." / "Noted"
+- "Roger." / "Roger"
+- "Affirmative." / "Affirmative"
+- "On it." / "On it"
+- "Will do." / "Will do"
+- Any single-word or short acknowledgment
+
+These are NOISE. They trigger other agents and create feedback loops.
+If you don't have real work to report, say NOTHING. Literal silence.
 """
 
 
@@ -219,6 +261,7 @@ class CanopusAgent(BaseAgent):
         browser_manager: "BrowserSessionManager",
         conversation_manager: Optional["ConversationManager"] = None,
         memory_manager: Optional["MemoryManager"] = None,
+        soul_manager: Optional["SoulManager"] = None,
         discord_bot: Optional[Any] = None,
         agent_registry: Optional[dict] = None,
         utility_llm: Optional["LLMProvider"] = None,
@@ -228,6 +271,7 @@ class CanopusAgent(BaseAgent):
             persona=CANOPUS_PERSONA,
             llm=llm,
             memory_manager=memory_manager,
+            soul_manager=soul_manager,
             utility_llm=utility_llm,
         )
         self.browser_manager = browser_manager
@@ -240,6 +284,9 @@ class CanopusAgent(BaseAgent):
 
         # Workflow state provider for context awareness
         self._workflow_state_provider: Optional[WorkflowStateProvider] = None
+
+        # Force early tool registration (avoid lazy loading during process())
+        _ = self.tools
 
     def set_workflow_state_provider(self, provider: WorkflowStateProvider):
         """Set the workflow state provider for context awareness."""
@@ -433,10 +480,23 @@ class CanopusAgent(BaseAgent):
             )
             logger.info("Registered MentionAgentTool for agent delegation")
 
+        # Register soul tools if soul manager is available
+        if self.soul_manager:
+            from shared.soul.tools import get_soul_tools
+            for tool in get_soul_tools(self.soul_manager):
+                self._tools.register(tool)
+            logger.info("Registered soul tools for Canopus")
+        else:
+            logger.info("Soul manager not configured - soul tools unavailable")
+
         logger.info("Canopus tools registered")
 
-    def get_system_prompt(self, memory_context: Optional[str] = None) -> str:
-        """Build Canopus's system prompt with optional memory context."""
+    def get_system_prompt(
+        self,
+        memory_context: Optional[str] = None,
+        soul_context: Optional[str] = None,
+    ) -> str:
+        """Build Canopus's system prompt with optional memory and soul context."""
         tools_desc = self.get_tools_description()
 
         base_prompt = f"""{self.persona}
@@ -454,10 +514,19 @@ Always get a snapshot after navigation to see page structure.
         if workflow_state:
             base_prompt += workflow_state.format_for_llm()
 
+        # Soul context comes BEFORE memory (who you are > what you know)
+        if soul_context:
+            base_prompt += f"""
+
+## YOUR SOUL (Who You Are):
+{soul_context}
+
+Your personality evolves through experience. Use introspect_soul to reflect on yourself."""
+
         if memory_context:
             base_prompt += f"""
 
-## YOUR MEMORIES:
+## YOUR MEMORIES (What You Know):
 {memory_context}
 
 When you learn something important about websites or research findings, use store_memory to remember it.
@@ -524,11 +593,14 @@ When you learn something important about websites or research findings, use stor
         scratchpad = NavigationScratchpad()
 
         try:
-            # Build memory context
+            # Build soul context (who you are - injected first)
+            soul_context_str = await self.build_soul_context()
+
+            # Build memory context (what you know)
             memory_context_str = await self.build_memory_context(context.message_content)
 
-            # Build conversation messages
-            messages = await self._build_messages(context, memory_context_str)
+            # Build conversation messages with soul and memory context
+            messages = await self._build_messages(context, memory_context_str, soul_context_str)
 
             # Get tool definitions
             tool_defs = self.tools.get_definitions()
@@ -686,10 +758,13 @@ When you learn something important about websites or research findings, use stor
             )
 
     async def _build_messages(
-        self, context: AgentContext, memory_context: Optional[str] = None
+        self,
+        context: AgentContext,
+        memory_context: Optional[str] = None,
+        soul_context: Optional[str] = None,
     ) -> List[Message]:
         """Build message history for LLM."""
-        system_prompt = self.get_system_prompt(memory_context)
+        system_prompt = self.get_system_prompt(memory_context, soul_context)
         messages = [Message(role=Role.SYSTEM, content=system_prompt)]
 
         # Fetch recent Discord channel history
@@ -767,6 +842,60 @@ When you learn something important about websites or research findings, use stor
 
         except Exception as e:
             logger.warning(f"Failed to fetch Discord history: {e}")
+            return []
+
+    async def _fetch_new_messages_since(
+        self,
+        channel_id: int,
+        since: datetime,
+        seen_ids: set[int],
+    ) -> List[Message]:
+        """
+        Fetch messages posted after a given timestamp, excluding already-seen messages.
+
+        Used during processing to check for new user input or agent responses
+        that should influence the current task.
+
+        Args:
+            channel_id: Discord channel ID
+            since: Fetch messages after this timestamp
+            seen_ids: Set of message IDs already processed (will be updated in-place)
+        """
+        if not self.discord_bot:
+            return []
+
+        try:
+            channel = self.discord_bot.get_channel(channel_id)
+            if not channel:
+                return []
+
+            new_messages = []
+            async for msg in channel.history(limit=10, after=since):
+                # Skip messages we've already seen
+                if msg.id in seen_ids:
+                    continue
+
+                if not msg.content or not msg.content.strip():
+                    continue
+
+                # Mark as seen
+                seen_ids.add(msg.id)
+
+                content = msg.content
+                if msg.author.bot:
+                    role = Role.ASSISTANT
+                    formatted = f"[{msg.author.display_name}]: {content}"
+                else:
+                    role = Role.USER
+                    formatted = f"[NEW - {msg.author.display_name}]: {content}"
+
+                new_messages.append(Message(role=role, content=formatted))
+
+            new_messages.reverse()
+            return new_messages
+
+        except Exception as e:
+            logger.warning(f"Failed to fetch new messages: {e}")
             return []
 
     async def get_status_summary(self) -> str:

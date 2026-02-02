@@ -67,6 +67,14 @@ class BaseAgentConfig:
     utility_llm_api_key: Optional[str] = None   # Falls back to llm_api_key if not set
     utility_llm_model: Optional[str] = None     # Falls back to llm_model if not set
 
+    # Thinking LLM (for complex reasoning, architecture decisions - use reasoning model)
+    thinking_llm_provider: Optional[str] = None  # Falls back to llm_provider if not set
+    thinking_llm_api_key: Optional[str] = None   # Falls back to llm_api_key if not set
+    thinking_llm_model: Optional[str] = None     # Falls back to llm_model if not set
+
+    # Ollama-specific
+    ollama_base_url: Optional[str] = None  # Default: http://localhost:11434
+
     # Database
     redis_url: Optional[str] = None
 
@@ -102,6 +110,12 @@ class BaseAgentConfig:
         utility_api_key = get_env("UTILITY_LLM_API_KEY") or None
         utility_model = get_env("UTILITY_LLM_MODEL") or None
 
+        # Thinking LLM settings (for complex reasoning)
+        # Falls back to primary LLM if not set
+        thinking_provider = get_env("THINKING_LLM_PROVIDER") or None
+        thinking_api_key = get_env("THINKING_LLM_API_KEY") or None
+        thinking_model = get_env("THINKING_LLM_MODEL") or None
+
         return cls(
             agent_name=agent_name,
             discord_token=get_env("DISCORD_TOKEN"),
@@ -113,6 +127,10 @@ class BaseAgentConfig:
             utility_llm_provider=utility_provider,
             utility_llm_api_key=utility_api_key,
             utility_llm_model=utility_model,
+            thinking_llm_provider=thinking_provider,
+            thinking_llm_api_key=thinking_api_key,
+            thinking_llm_model=thinking_model,
+            ollama_base_url=get_env("OLLAMA_BASE_URL") or None,
             redis_url=get_env("REDIS_URL") or None,
             workspace_dir=get_env("WORKSPACE_DIR", "/tmp/workspace"),
             agent_registry=AgentRegistryConfig.from_env(),

@@ -15,7 +15,7 @@ from shared.agent_coordinator import (
     DistributedAgentTracker,
     AgentAcknowledgmentMixin,
 )
-from shared.discord_utils import is_from_known_agent
+from shared.discord_utils import is_from_known_agent, convert_text_mentions_to_discord
 from shared.job_graph.executor import JobGraphExecutor
 
 logger = logging.getLogger(__name__)
@@ -45,6 +45,7 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
         self.project_manager = None
         self.conversation_manager = None
         self.memory_manager = None
+        self.soul_manager = None
         self._agent_initialized = False
         self._agent_registry: dict[str, int] = {}
 
@@ -100,7 +101,7 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
             return
 
         try:
-            from shared.llm.factory import create_llm_provider, create_utility_llm_from_config
+            from shared.llm.factory import create_llm_provider, create_utility_llm_from_config, create_thinking_llm_from_config
             from vega.config import get_config
 
             config = get_config()
@@ -118,17 +119,31 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
             if self.utility_llm:
                 logger.info("Initialized utility LLM")
 
+            # Create thinking LLM for complex reasoning tasks
+            self.thinking_llm = create_thinking_llm_from_config(config)
+            if self.thinking_llm:
+                logger.info("Initialized thinking LLM")
+
             # Initialize Redis-backed managers if available
             if Config.REDIS_URL:
                 try:
                     from shared.project import ProjectManager
                     from shared.conversation import ConversationManager
                     from shared.memory import MemoryManager
+                    from shared.soul import SoulManager, get_default_traits
 
                     self.project_manager = ProjectManager(Config.REDIS_URL)
                     self.conversation_manager = ConversationManager(Config.REDIS_URL)
                     self.memory_manager = MemoryManager(Config.REDIS_URL)
-                    logger.info("Initialized Redis-backed managers")
+                    self.soul_manager = SoulManager(Config.REDIS_URL)
+                    logger.info("Initialized Redis-backed managers (including soul)")
+
+                    # Initialize default soul traits for Vega if not already present
+                    asyncio.create_task(
+                        self.soul_manager.ensure_defaults_initialized(
+                            "vega", get_default_traits("vega")
+                        )
+                    )
                 except ImportError as e:
                     logger.warning(f"Redis managers not available: {e}")
 
@@ -158,9 +173,11 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
                 project_manager=self.project_manager,
                 conversation_manager=self.conversation_manager,
                 memory_manager=self.memory_manager,
+                soul_manager=self.soul_manager,
                 discord_bot=self.bot,
                 agent_registry=self._agent_registry,
                 utility_llm=self.utility_llm,
+                thinking_llm=self.thinking_llm,
             )
 
             self._agent_initialized = True
@@ -183,32 +200,41 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
         if not self.executor:
             return
 
-        timed_out = self.executor.check_timeouts()
-        for graph, node in timed_out:
-            logger.warning(
-                f"[Vega] Node '{node.id}' timed out in graph '{graph.id}' "
-                f"(agent={node.agent}, timeout={node.timeout}s)"
-            )
-            # Post timeout embed to thread
-            await self.executor._post_timeout_embed(graph, node)
+        try:
+            timed_out = self.executor.check_timeouts()
+            for graph, node in timed_out:
+                logger.warning(
+                    f"[Vega] Node '{node.id}' timed out in graph '{graph.id}' "
+                    f"(agent={node.agent}, timeout={node.timeout}s)"
+                )
+                # Post timeout embed to thread
+                try:
+                    await self.executor._post_timeout_embed(graph, node)
+                except Exception as embed_err:
+                    logger.error(f"[Vega] Failed to post timeout embed: {embed_err}")
 
-            # Trigger Vega re-evaluation with the timeout context
-            channel = self.bot.get_channel(graph.channel_id)
-            if channel and self.vega_agent:
-                context = AgentContext(
-                    channel_id=graph.channel_id,
-                    user_id=0,  # System-triggered
-                    message_content=f"[SYSTEM] Node '{node.id}' (agent: {node.agent}) timed out. Evaluate and decide: retry, reassign, or fail the goal.",
-                    conversation_id=await self._get_or_create_conversation(
-                        channel_id=graph.channel_id,
-                        user_id=0,
-                    ),
-                )
-                await self.message_queue.enqueue(
-                    message=None,
-                    context=context,
-                    is_from_agent=False,
-                )
+                # Trigger Vega re-evaluation with the timeout context
+                channel = self.bot.get_channel(graph.channel_id)
+                if channel and self.vega_agent:
+                    try:
+                        context = AgentContext(
+                            channel_id=graph.channel_id,
+                            user_id=0,  # System-triggered
+                            message_content=f"[SYSTEM] Node '{node.id}' (agent: {node.agent}) timed out. Evaluate and decide: retry, reassign, or fail the goal.",
+                            conversation_id=await self._get_or_create_conversation(
+                                channel_id=graph.channel_id,
+                                user_id=0,
+                            ),
+                        )
+                        await self.message_queue.enqueue(
+                            message=None,
+                            context=context,
+                            is_from_agent=False,
+                        )
+                    except Exception as enqueue_err:
+                        logger.error(f"[Vega] Failed to enqueue timeout re-evaluation: {enqueue_err}")
+        except Exception as e:
+            logger.error(f"[Vega] timeout_checker error: {e}", exc_info=True)
 
     @timeout_checker.before_loop
     async def before_timeout_checker(self):
@@ -244,14 +270,19 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
 
         # Determine message source
         is_from_user = message.author.id == Config.ALLOWED_USER_ID
+        is_mentioned = self.bot.user and self.bot.user.mentioned_in(message)
         agent_name = is_from_known_agent(message, self._agent_registry)
         is_from_agent = agent_name is not None
 
-        # Ignore messages from unknown users/bots
-        if not is_from_user and not is_from_agent:
+        # Respond if: allowed user, @mentioned, or from another agent
+        if not is_from_user and not is_from_agent and not is_mentioned:
             return
 
         content = message.content.strip()
+
+        # Strip the @mention from content if present
+        if is_mentioned and self.bot.user:
+            content = content.replace(f'<@{self.bot.user.id}>', '').replace(f'<@!{self.bot.user.id}>', '').strip()
 
         # Ignore all commands - Altair handles them
         if content.startswith('!'):
@@ -259,10 +290,12 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
 
         # ---- AGENT MESSAGE: route to graph node ----
         if is_from_agent and agent_name:
-            await self._handle_agent_response(message, agent_name)
-            return
+            handled = await self._handle_agent_response(message, agent_name)
+            if handled:
+                return
+            # Not handled by graph - fall through to process as new conversation
 
-        # ---- USER MESSAGE: trigger Vega processing ----
+        # ---- USER/AGENT MESSAGE: trigger Vega processing ----
         if content and self._agent_initialized:
             conversation_id = await self._get_or_create_conversation(
                 channel_id=message.channel.id,
@@ -281,22 +314,25 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
             await self.message_queue.enqueue(
                 message=message,
                 context=context,
-                is_from_agent=False,
+                is_from_agent=is_from_agent,
             )
 
     # --------------------------------------------------
     # AGENT RESPONSE HANDLING
     # --------------------------------------------------
 
-    async def _handle_agent_response(self, message: discord.Message, agent_name: str):
+    async def _handle_agent_response(self, message: discord.Message, agent_name: str) -> bool:
         """
         Handle a response from another agent.
 
         Match it to a running graph node and trigger Vega re-evaluation
         so she can update the node, dispatch more work, or respond to user.
+
+        Returns:
+            True if the message was handled (matched a graph node), False otherwise.
         """
         if not self.executor or not self.vega_agent:
-            return
+            return False
 
         channel_id = message.channel.id
 
@@ -306,9 +342,9 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
         if not match:
             logger.debug(
                 f"[Vega] Agent '{agent_name}' responded but no matching node found. "
-                f"Ignoring (may be unprompted or from a completed graph)."
+                f"Will process as new conversation."
             )
-            return
+            return False
 
         graph, node = match
         logger.info(
@@ -335,6 +371,31 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
         # Include the agent's actual response for Vega to evaluate
         agent_response_content = message.content[:1500] if message.content else "(no content)"
 
+        # Detect if this is a cancellation/abort response
+        is_cancelled = any(phrase in agent_response_content.lower() for phrase in [
+            "stopped", "cancelled", "aborted", "i've stopped", "user cancelled",
+            "permission denied", "rejected", "what would you like me to do instead"
+        ])
+
+        if is_cancelled:
+            eval_instructions = (
+                f"The user CANCELLED this task. Take action:\n"
+                f"1. Call update_node to mark '{node.id}' as 'cancelled'.\n"
+                f"2. Decide what to do next:\n"
+                f"   - If there are other PENDING/READY nodes that don't depend on this, dispatch them.\n"
+                f"   - If the cancellation breaks the workflow, you may need to use add_nodes to adapt the plan.\n"
+                f"   - If there's nothing else to do, call respond_to_user to acknowledge the cancellation.\n"
+                f"3. Do NOT wait - take immediate action now."
+            )
+        else:
+            eval_instructions = (
+                f"Evaluate this response:\n"
+                f"1. Call update_node to mark '{node.id}' as 'completed' or 'failed'.\n"
+                f"2. Check remaining PENDING/READY nodes in the graph - if the agent's response "
+                f"already covers their work, cancel them with cancel_nodes.\n"
+                f"3. If all work is done, call respond_to_user with the final answer."
+            )
+
         context = AgentContext(
             channel_id=channel_id,
             user_id=0,  # System-triggered (agent response)
@@ -344,11 +405,7 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
                 f"--- {agent_name}'s response ---\n"
                 f"{agent_response_content}\n"
                 f"--- end response ---\n\n"
-                f"Evaluate this response:\n"
-                f"1. Call update_node to mark '{node.id}' as completed or failed.\n"
-                f"2. Check remaining PENDING/READY nodes in the graph - if the agent's response "
-                f"already covers their work, cancel them with cancel_nodes.\n"
-                f"3. If all work is done, call respond_to_user with the final answer."
+                f"{eval_instructions}"
             ),
             conversation_id=conversation_id,
         )
@@ -358,6 +415,7 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
             context=context,
             is_from_agent=True,
         )
+        return True
 
     # --------------------------------------------------
     # REACTION HANDLER
@@ -404,49 +462,57 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
             channel = self.bot.get_channel(context.channel_id)
 
         async def _run():
-            response = await self.vega_agent.process(
-                context=context,
-                job_executor=self.executor,
-                trigger_message=message,  # For thread creation in create_plan
-            )
-
-            if response.content:
-                target_channel = channel
-                if not target_channel:
-                    return
-
-                chunks = self._split_message(response.content)
-                logger.info(
-                    f"[Vega] SENDING RESPONSE: chunks={len(chunks)}, "
-                    f"total_len={len(response.content)}, "
-                    f"tool_calls={response.tool_calls_made}"
-                )
-                for chunk in chunks:
-                    await target_channel.send(chunk)
-            else:
-                logger.info(
-                    f"[Vega] NO RESPONSE CONTENT: "
-                    f"tool_calls={response.tool_calls_made} (dispatched work)"
+            try:
+                response = await self.vega_agent.process(
+                    context=context,
+                    job_executor=self.executor,
+                    trigger_message=message,  # For thread creation in create_plan
                 )
 
-            logger.info(
-                f"[Vega] PROCESS COMPLETE: time={response.processing_time_ms}ms, "
-                f"tools={response.tool_calls_made}"
-            )
+                # Send response if we have content
+                if response.content:
+                    target_channel = channel
+                    if not target_channel:
+                        return
+
+                    # Convert @Name text to actual Discord mentions
+                    content = await convert_text_mentions_to_discord(
+                        response.content,
+                        target_channel,
+                        self._agent_registry,
+                    )
+
+                    # Send in chunks if needed
+                    chunks = self._split_message(content)
+                    logger.info(
+                        f"[Vega] SENDING RESPONSE: chunks={len(chunks)}, "
+                        f"total_len={len(content)}, "
+                        f"tool_calls={response.tool_calls_made}"
+                    )
+                    for chunk in chunks:
+                        await target_channel.send(chunk)
+                else:
+                    logger.info(
+                        f"[Vega] NO RESPONSE CONTENT: "
+                        f"tool_calls={response.tool_calls_made} (dispatched work)"
+                    )
+
+                logger.info(
+                    f"[Vega] PROCESS COMPLETE: time={response.processing_time_ms}ms, "
+                    f"tools={response.tool_calls_made}"
+                )
+
+            except Exception as e:
+                logger.error(f"[Vega] Process error: {e}", exc_info=True)
+                if channel:
+                    await channel.send(f"**Error:** {e}")
 
         if channel:
             async with channel.typing():
-                try:
-                    await _run()
-                except Exception as e:
-                    logger.error(f"[Vega] PROCESS ERROR: {e}", exc_info=True)
-                    await channel.send(f"**Error:** {e}")
+                await _run()
         else:
             # No channel for typing indicator (system-triggered)
-            try:
-                await _run()
-            except Exception as e:
-                logger.error(f"[Vega] PROCESS ERROR (no channel): {e}", exc_info=True)
+            await _run()
 
     # --------------------------------------------------
     # HELPERS

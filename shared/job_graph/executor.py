@@ -216,9 +216,30 @@ class JobGraphExecutor:
         candidates.sort(key=lambda x: x[1].dispatched_at or x[1].created_at)
         return candidates[0]
 
+    def get_channel_graphs_context(self, channel_id: int) -> str:
+        """
+        Get context string for active graphs in a specific channel.
+
+        This helps Vega decide whether to extend an existing graph or create new.
+        """
+        active = self.get_active_graphs(channel_id)
+        if not active:
+            return "ACTIVE JOB GRAPHS: None in this channel. You may create a new plan."
+
+        lines = ["ACTIVE JOB GRAPHS (this channel):"]
+        lines.append(">>> If the user's message relates to these graphs, use `add_nodes` to extend them.")
+        lines.append(">>> Only use `create_plan` for completely unrelated tasks.")
+        lines.append("")
+
+        for graph in active:
+            lines.append(graph.get_context_for_llm())
+            lines.append("")
+
+        return "\n".join(lines)
+
     def get_all_graphs_context(self) -> str:
         """
-        Get context string for all active graphs.
+        Get context string for all active graphs across all channels.
 
         This is included in Vega's system prompt so she's fully aware
         of everything happening.

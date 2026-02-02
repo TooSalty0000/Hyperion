@@ -20,10 +20,13 @@ def _get_provider_class(provider: str) -> Type[LLMProvider]:
         elif provider == "anthropic":
             from .anthropic import AnthropicProvider
             _PROVIDER_CLASSES["anthropic"] = AnthropicProvider
+        elif provider == "ollama":
+            from .ollama import OllamaProvider
+            _PROVIDER_CLASSES["ollama"] = OllamaProvider
         else:
             raise ValueError(
                 f"Unknown provider: {provider}. "
-                f"Available providers: gemini, openai, anthropic"
+                f"Available providers: gemini, openai, anthropic, ollama"
             )
     return _PROVIDER_CLASSES[provider]
 
@@ -32,14 +35,24 @@ def _get_provider_class(provider: str) -> Type[LLMProvider]:
 DEFAULT_MODELS = {
     "gemini": "gemini-2.0-flash-exp",
     "openai": "gpt-4o",
-    "anthropic": "claude-sonnet-4-20250514"
+    "anthropic": "claude-sonnet-4-20250514",
+    "ollama": "gemma3:4b"
 }
 
 # Default utility models (cheaper/faster for quick evaluations like chime-in)
 DEFAULT_UTILITY_MODELS = {
     "gemini": "gemini-2.5-flash-lite",
     "openai": "gpt-4o-mini",
-    "anthropic": "claude-3-5-haiku-20241022"
+    "anthropic": "claude-3-5-haiku-20241022",
+    "ollama": "gemma3:4b"
+}
+
+# Default thinking models (for complex reasoning, architecture decisions)
+DEFAULT_THINKING_MODELS = {
+    "gemini": "gemini-2.5-pro-exp-03-25",
+    "openai": "o1",
+    "anthropic": "claude-sonnet-4-20250514",
+    "ollama": "qwen2.5:14b"  # Larger model for complex reasoning
 }
 
 
@@ -115,6 +128,57 @@ def create_utility_llm_from_config(config) -> Optional[LLMProvider]:
         model = DEFAULT_UTILITY_MODELS.get(provider)
 
     try:
-        return create_llm_provider(provider=provider, api_key=api_key, model=model)
+        kwargs = {}
+        # Pass Ollama base URL if configured
+        if provider == "ollama":
+            base_url = getattr(config, 'ollama_base_url', None)
+            if base_url:
+                kwargs["base_url"] = base_url
+
+        return create_llm_provider(provider=provider, api_key=api_key, model=model, **kwargs)
+    except Exception:
+        return None
+
+
+def create_thinking_llm_from_config(config) -> Optional[LLMProvider]:
+    """
+    Create a thinking LLM provider from agent config settings.
+
+    The thinking LLM is used for complex reasoning, architecture decisions,
+    and tasks that benefit from deeper analysis.
+    Falls back to main LLM settings if thinking settings not configured.
+    Uses DEFAULT_THINKING_MODELS if no model specified.
+
+    Args:
+        config: Agent config with thinking_llm_provider, thinking_llm_api_key,
+                thinking_llm_model, and main LLM settings for fallback
+
+    Returns:
+        LLMProvider instance for thinking tasks, or None if no LLM configured
+    """
+    # Determine provider (thinking -> main fallback)
+    provider = getattr(config, 'thinking_llm_provider', None) or getattr(config, 'llm_provider', None)
+    if not provider:
+        return None
+
+    # Determine API key (thinking -> main fallback)
+    api_key = getattr(config, 'thinking_llm_api_key', None) or getattr(config, 'llm_api_key', None)
+    if not api_key:
+        return None
+
+    # Determine model (thinking -> default thinking model for provider)
+    model = getattr(config, 'thinking_llm_model', None)
+    if not model:
+        model = DEFAULT_THINKING_MODELS.get(provider)
+
+    try:
+        kwargs = {}
+        # Pass Ollama base URL if configured
+        if provider == "ollama":
+            base_url = getattr(config, 'ollama_base_url', None)
+            if base_url:
+                kwargs["base_url"] = base_url
+
+        return create_llm_provider(provider=provider, api_key=api_key, model=model, **kwargs)
     except Exception:
         return None

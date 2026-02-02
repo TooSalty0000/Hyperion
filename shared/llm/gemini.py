@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import time
 from typing import List, Optional, AsyncIterator, Any, Tuple
 
 from .interface import LLMProvider
@@ -367,10 +368,13 @@ class GeminiProvider(LLMProvider):
         **kwargs
     ) -> LLMResponse:
         """Generate a completion from Gemini with retry logic."""
+        start_time = time.time()
         _, types = _import_genai()
 
+        format_start = time.time()
         contents, system = self.format_messages(messages)
         tool_config = self.format_tools(tools) if tools else None
+        format_time = (time.time() - format_start) * 1000
 
         # Allow custom response schema via kwargs (e.g., for chime-in decisions)
         response_schema = kwargs.get("response_schema", RESPONSE_SCHEMA)
@@ -386,15 +390,35 @@ class GeminiProvider(LLMProvider):
 
         last_error = None
         backoff = INITIAL_BACKOFF
+        tool_count = len(tools) if tools else 0
+        msg_count = len(messages)
+
+        logger.debug(
+            f"[LLM] Starting request: messages={msg_count}, tools={tool_count}, "
+            f"format_time={format_time:.1f}ms"
+        )
 
         for attempt in range(MAX_RETRIES + 1):
             try:
+                api_start = time.time()
                 response = await self._client.aio.models.generate_content(
                     model=self.model,
                     contents=contents,
                     config=config
                 )
-                return self.parse_response(response)
+                api_time = (time.time() - api_start) * 1000
+                total_time = (time.time() - start_time) * 1000
+
+                parsed = self.parse_response(response)
+
+                # Log timing details
+                tool_calls = len(parsed.tool_calls) if parsed.tool_calls else 0
+                logger.debug(
+                    f"[LLM] ✓ Complete: api={api_time:.0f}ms, total={total_time:.0f}ms, "
+                    f"tool_calls={tool_calls}, content_len={len(parsed.content) if parsed.content else 0}"
+                )
+
+                return parsed
 
             except Exception as e:
                 last_error = e

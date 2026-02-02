@@ -11,6 +11,7 @@ Usage:
     python run_all.py --polaris  # Start only Polaris
     python run_all.py --canopus  # Start only Canopus
     python run_all.py --vega --polaris  # Start Vega and Polaris
+    python run_all.py --verbose  # Enable verbose timing logs
 """
 
 import asyncio
@@ -113,14 +114,25 @@ class ColoredFormatter(logging.Formatter):
 handler = logging.StreamHandler()
 handler.setFormatter(ColoredFormatter(datefmt="%Y-%m-%d %H:%M:%S"))
 
+# Check for verbose flag early (before full arg parsing)
+VERBOSE_MODE = "--verbose" in sys.argv or "-v" in sys.argv
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG if VERBOSE_MODE else logging.INFO,
     handlers=[handler],
 )
 
-# Reduce noise from discord.py
+# Reduce noise from discord.py (even in verbose mode)
 logging.getLogger("discord").setLevel(logging.WARNING)
 logging.getLogger("discord.http").setLevel(logging.WARNING)
+
+# In verbose mode, show more detail from our modules
+if VERBOSE_MODE:
+    # Enable DEBUG for timing-related loggers
+    logging.getLogger("shared.llm").setLevel(logging.DEBUG)
+    logging.getLogger("shared.tools").setLevel(logging.DEBUG)
+    logging.getLogger("shared.agent_queue").setLevel(logging.DEBUG)
+    logging.getLogger("shared.discord_utils").setLevel(logging.DEBUG)
 
 logger = logging.getLogger("run_all")
 
@@ -158,15 +170,21 @@ class BotManager:
                 await bot.close()
 
     async def run_all(self):
-        """Run all registered bots concurrently."""
+        """Run all registered bots concurrently with staggered starts."""
         if not self.bots:
             logger.error("No bots registered")
             return
 
-        # Create tasks for each bot
-        for name, (bot, token) in self.bots.items():
+        # Start bots with staggered delays to avoid Discord rate limiting
+        # Discord can reject connections when too many bots connect at once from the same IP
+        bot_items = list(self.bots.items())
+        for i, (name, (bot, token)) in enumerate(bot_items):
             task = asyncio.create_task(self.start_bot(name, bot, token))
             self.tasks[name] = task
+
+            # Add delay between bot starts (except after the last one)
+            if i < len(bot_items) - 1:
+                await asyncio.sleep(2.0)  # 2 second delay between each bot
 
         logger.info(f"Started {len(self.tasks)} bot(s): {', '.join(self.tasks.keys())}")
         logger.info("Press Ctrl+C to shutdown all bots")
@@ -241,6 +259,10 @@ async def main(
                 @vega_bot.event
                 async def on_ready():
                     logger.info(f"Vega connected as {vega_bot.user}")
+                    # Populate member cache from all guilds
+                    from shared.discord_utils import get_member_cache
+                    cache = get_member_cache()
+                    cache.populate_from_guilds(vega_bot.guilds)
 
                 @vega_bot.event
                 async def on_command_error(ctx, error):
@@ -329,6 +351,9 @@ if __name__ == "__main__":
         run_altair = True
         run_polaris = True
         run_canopus = True
+
+    if VERBOSE_MODE:
+        logger.info("🔍 Verbose mode enabled - showing timing details")
 
     try:
         asyncio.run(main(

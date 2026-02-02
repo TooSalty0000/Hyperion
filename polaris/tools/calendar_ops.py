@@ -140,7 +140,7 @@ class CreateEventTool(Tool):
             ToolParameter(
                 name="time",
                 type="string",
-                description="Start time (e.g., '2pm', '14:30', '2:30 PM')",
+                description="Start time (e.g., '2pm', '14:30', '2:30 PM', '11:30 AM KST'). Include the timezone abbreviation if the user specifies one.",
                 required=True,
             ),
             ToolParameter(
@@ -181,11 +181,16 @@ class CreateEventTool(Tool):
         if not context.calendar_service:
             return "Error: Google Calendar service not available. Please configure credentials."
 
-        tz = context.config.timezone if context.config else "UTC"
+        config_tz = context.config.timezone if context.config else "UTC"
         try:
-            # Parse the datetime in the user's timezone
-            start_dt = parse_datetime(date, time, timezone=tz)
+            # Parse the datetime — timezone may come from the time string itself
+            # (e.g., "11:30 AM KST") or fall back to the config timezone
+            start_dt = parse_datetime(date, time, timezone=config_tz)
             end_dt = start_dt + timedelta(minutes=duration_minutes)
+
+            # Use the timezone from the parsed datetime (which may have been
+            # extracted from the time string, e.g., "KST" -> "Asia/Seoul")
+            tz = str(start_dt.tzinfo) if start_dt.tzinfo else config_tz
 
             # Build event body with timezone-aware datetimes
             event = {
@@ -540,6 +545,9 @@ class UpdateEventTool(Tool):
                         day=existing_dt.day,
                     )
 
+                # Use timezone from the parsed datetime (may come from time string)
+                effective_tz = str(new_start.tzinfo) if new_start.tzinfo else tz
+
                 # Calculate duration
                 existing_end = event.get("end", {})
                 if "dateTime" in existing_end:
@@ -557,12 +565,12 @@ class UpdateEventTool(Tool):
                 new_end = new_start + duration
 
                 event["start"] = {
-                    "dateTime": format_datetime_for_api(new_start, timezone=tz),
-                    "timeZone": tz,
+                    "dateTime": format_datetime_for_api(new_start, timezone=effective_tz),
+                    "timeZone": effective_tz,
                 }
                 event["end"] = {
-                    "dateTime": format_datetime_for_api(new_end, timezone=tz),
-                    "timeZone": tz,
+                    "dateTime": format_datetime_for_api(new_end, timezone=effective_tz),
+                    "timeZone": effective_tz,
                 }
 
             # Update the event
@@ -648,18 +656,32 @@ class DeleteEventTool(Tool):
             return "Error: Please provide either event_id or event_title to identify the event."
 
         try:
+            from googleapiclient.errors import HttpError
+
             # Get event details first for confirmation
-            event = (
-                context.calendar_service.events()
-                .get(calendarId=calendar_id, eventId=event_id)
-                .execute()
-            )
-            event_title = event.get("summary", "Untitled")
+            try:
+                event = (
+                    context.calendar_service.events()
+                    .get(calendarId=calendar_id, eventId=event_id)
+                    .execute()
+                )
+                event_title = event.get("summary", "Untitled")
+            except HttpError as e:
+                if e.resp.status == 410:
+                    logger.info(f"Event {event_id} already deleted (410 on GET)")
+                    return f"Event already deleted (ID: {event_id})"
+                raise
 
             # Delete the event
-            context.calendar_service.events().delete(
-                calendarId=calendar_id, eventId=event_id
-            ).execute()
+            try:
+                context.calendar_service.events().delete(
+                    calendarId=calendar_id, eventId=event_id
+                ).execute()
+            except HttpError as e:
+                if e.resp.status == 410:
+                    logger.info(f"Event '{event_title}' already deleted (410 on DELETE)")
+                    return f"Event already deleted: **{event_title}**"
+                raise
 
             return f"Event deleted: **{event_title}**"
 

@@ -1,4 +1,4 @@
-.PHONY: help install start start-vega start-altair start-all clean test-imports test
+.PHONY: help install start start-vega start-altair start-all start-verbose clean test-imports test
 
 PYTHON = python3
 PIP = pip3
@@ -7,10 +7,11 @@ help:
 	@echo "Vega Multi-Agent Bot System"
 	@echo "---------------------------"
 	@echo "make install       - Install dependencies from requirements.txt"
-	@echo "make start         - Run Vega bot (alias for start-vega)"
-	@echo "make start-vega    - Run Vega bot"
-	@echo "make start-altair  - Run Altair bot"
-	@echo "make start-all     - Run all bots (Vega + Altair)"
+	@echo "make start         - Run all bots"
+	@echo "make start-vega    - Run Vega bot only"
+	@echo "make start-altair  - Run Altair bot only"
+	@echo "make start-all     - Run all bots (Vega + Altair + Polaris + Canopus)"
+	@echo "make start-verbose - Run all bots with timing details"
 	@echo "make test          - Run pytest test suite"
 	@echo "make test-imports  - Test all module imports"
 	@echo "make clean         - Remove pycache and temporary files"
@@ -28,6 +29,9 @@ start-altair:
 
 start-all:
 	$(PYTHON) run_all.py
+
+start-verbose:
+	$(PYTHON) run_all.py --verbose
 
 test:
 	$(PYTHON) -m pytest tests/ -v

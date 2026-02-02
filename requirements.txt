@@ -9,6 +9,7 @@ pytest-asyncio
 google-genai  # For Gemini
 # openai>=1.0.0  # For OpenAI (optional)
 # anthropic>=0.18.0  # For Anthropic (optional)
+ollama>=0.4.0  # For Ollama (local models)
 
 # Redis (optional - enables persistence features)
 redis

@@ -1,5 +1,6 @@
 """Redis-backed memory storage for agents."""
 
+import asyncio
 import json
 import uuid
 import re
@@ -178,6 +179,60 @@ class MemoryManager:
 
         return memory
 
+    async def get_memory_readonly(
+        self, agent_id: str, memory_id: str
+    ) -> Optional[MemoryEntry]:
+        """
+        Retrieve a memory by ID without updating access metadata.
+
+        Use this for read-only context building to avoid unnecessary writes.
+        """
+        redis = await self._get_client()
+
+        entry_key = self.ENTRY_KEY.format(agent_id=agent_id, memory_id=memory_id)
+        data = await redis.get(entry_key)
+
+        if not data:
+            return None
+
+        return MemoryEntry.from_dict(json.loads(data))
+
+    async def get_memories_batch(
+        self,
+        agent_id: str,
+        memory_ids: List[str],
+    ) -> List[MemoryEntry]:
+        """
+        Fetch multiple memories in a single mget call.
+
+        This is a read-only operation that doesn't update access metadata.
+        Use for context building to avoid N+1 Redis calls.
+
+        Args:
+            agent_id: Agent identifier
+            memory_ids: List of memory IDs to fetch
+
+        Returns:
+            List of MemoryEntry objects (excludes any not found)
+        """
+        if not memory_ids:
+            return []
+
+        redis = await self._get_client()
+        keys = [
+            self.ENTRY_KEY.format(agent_id=agent_id, memory_id=mid)
+            for mid in memory_ids
+        ]
+
+        results = await redis.mget(keys)
+
+        memories = []
+        for data in results:
+            if data:
+                memories.append(MemoryEntry.from_dict(json.loads(data)))
+
+        return memories
+
     async def update_memory(
         self,
         agent_id: str,
@@ -305,17 +360,18 @@ class MemoryManager:
         Get all short-term memories for context injection.
 
         Returns memories sorted by importance (highest first).
+        Uses batch fetch to avoid N+1 Redis calls.
         """
         redis = await self._get_client()
 
         short_key = self.SHORT_SET.format(agent_id=agent_id)
         memory_ids = await redis.smembers(short_key)
 
-        memories = []
-        for memory_id in memory_ids:
-            memory = await self.get_memory(agent_id, memory_id)
-            if memory:
-                memories.append(memory)
+        if not memory_ids:
+            return []
+
+        # Batch fetch all memories in one mget call
+        memories = await self.get_memories_batch(agent_id, list(memory_ids))
 
         # Sort by importance descending
         memories.sort(key=lambda m: m.importance, reverse=True)
@@ -437,16 +493,25 @@ class MemoryManager:
         Get summary of all categories for context.
 
         Returns list of dicts with name, description, count.
+        Uses batch fetch to avoid N+1 Redis calls.
         """
         redis = await self._get_client()
 
         categories_key = self.CATEGORIES_SET.format(agent_id=agent_id)
         category_ids = await redis.smembers(categories_key)
 
+        if not category_ids:
+            return []
+
+        # Batch fetch all categories in one mget call
+        keys = [
+            self.CATEGORY_KEY.format(agent_id=agent_id, category_id=cat_id)
+            for cat_id in category_ids
+        ]
+        results = await redis.mget(keys)
+
         summaries = []
-        for cat_id in category_ids:
-            cat_key = self.CATEGORY_KEY.format(agent_id=agent_id, category_id=cat_id)
-            data = await redis.get(cat_key)
+        for data in results:
             if data:
                 category = MemoryCategory.from_dict(json.loads(data))
                 summaries.append({
@@ -466,17 +531,21 @@ class MemoryManager:
         category: str,
         limit: int = 10,
     ) -> List[MemoryEntry]:
-        """Retrieve memories from a specific category."""
+        """
+        Retrieve memories from a specific category.
+
+        Uses batch fetch to avoid N+1 Redis calls.
+        """
         redis = await self._get_client()
 
         cat_mem_key = self.CATEGORY_MEMORIES.format(agent_id=agent_id, category_id=category)
         memory_ids = await redis.smembers(cat_mem_key)
 
-        memories = []
-        for memory_id in memory_ids:
-            memory = await self.get_memory(agent_id, memory_id)
-            if memory:
-                memories.append(memory)
+        if not memory_ids:
+            return []
+
+        # Batch fetch all memories in one mget call
+        memories = await self.get_memories_batch(agent_id, list(memory_ids))
 
         # Sort by importance descending
         memories.sort(key=lambda m: m.importance, reverse=True)
@@ -509,16 +578,28 @@ class MemoryManager:
         return category
 
     async def list_categories(self, agent_id: str) -> List[MemoryCategory]:
-        """List all categories for an agent."""
+        """
+        List all categories for an agent.
+
+        Uses batch fetch to avoid N+1 Redis calls.
+        """
         redis = await self._get_client()
 
         categories_key = self.CATEGORIES_SET.format(agent_id=agent_id)
         category_ids = await redis.smembers(categories_key)
 
+        if not category_ids:
+            return []
+
+        # Batch fetch all categories in one mget call
+        keys = [
+            self.CATEGORY_KEY.format(agent_id=agent_id, category_id=cat_id)
+            for cat_id in category_ids
+        ]
+        results = await redis.mget(keys)
+
         categories = []
-        for cat_id in category_ids:
-            cat_key = self.CATEGORY_KEY.format(agent_id=agent_id, category_id=cat_id)
-            data = await redis.get(cat_key)
+        for data in results:
             if data:
                 categories.append(MemoryCategory.from_dict(json.loads(data)))
 
@@ -649,6 +730,7 @@ class MemoryManager:
 
         Uses keyword overlap + recency + importance scoring.
         Only searches long-term memories (short-term already included).
+        Uses batch fetch to avoid N+1 Redis calls.
         """
         redis = await self._get_client()
 
@@ -658,16 +740,19 @@ class MemoryManager:
         if not context_keywords:
             return []
 
-        # Get all long-term memories
+        # Get all long-term memory IDs
         long_key = self.LONG_SET.format(agent_id=agent_id)
         memory_ids = await redis.smembers(long_key)
 
-        scored_memories = []
-        for memory_id in memory_ids:
-            memory = await self.get_memory(agent_id, memory_id)
-            if not memory:
-                continue
+        if not memory_ids:
+            return []
 
+        # Batch fetch all long-term memories in one mget call
+        memories = await self.get_memories_batch(agent_id, list(memory_ids))
+
+        # Score and filter memories
+        scored_memories = []
+        for memory in memories:
             score = self._calculate_relevance_score(context_keywords, memory)
             if score > 0.1:  # Minimum threshold
                 scored_memories.append((score, memory))
@@ -758,22 +843,22 @@ class MemoryManager:
         """
         Build complete memory context for agent prompt.
 
+        Uses parallel fetches to minimize Redis round-trips.
+
         Includes:
         - All short-term memories
         - Category headers for long-term
         - Auto-selected relevant long-term memories
         """
-        # Get short-term memories
-        short_term = await self.get_short_term_memories(agent_id)
-
-        # Get category summaries
-        categories = await self.get_category_summaries(agent_id)
-
-        # Get auto-selected relevant long-term memories
-        auto_selected = await self.get_relevant_memories(
-            agent_id=agent_id,
-            context=current_message,
-            limit=AUTO_SELECT_LIMIT,
+        # Fetch all memory data in parallel
+        short_term, categories, auto_selected = await asyncio.gather(
+            self.get_short_term_memories(agent_id),
+            self.get_category_summaries(agent_id),
+            self.get_relevant_memories(
+                agent_id=agent_id,
+                context=current_message,
+                limit=AUTO_SELECT_LIMIT,
+            ),
         )
 
         return MemoryContext(

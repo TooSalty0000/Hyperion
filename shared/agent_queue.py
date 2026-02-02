@@ -492,6 +492,9 @@ Reply with ONLY one word:
                 # Wait for next item
                 item = await self._queue.get()
 
+                # Calculate queue wait time
+                queue_wait_ms = (datetime.now() - item.queued_at).total_seconds() * 1000
+
                 self._is_processing = True
                 self._current_item = item
 
@@ -514,6 +517,10 @@ Reply with ONLY one word:
                 logger.info(
                     f"[{self.agent_name}] PROCESS START: msg_id={item.message_id}, "
                     f"queue_remaining={self._queue.qsize()}, content={item.context.message_content[:50]}..."
+                )
+                logger.debug(
+                    f"[Queue] {self.agent_name}: queue_wait={queue_wait_ms:.0f}ms, "
+                    f"from_agent={item.is_from_agent}"
                 )
 
                 # Notify task change if callback set

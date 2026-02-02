@@ -1,5 +1,6 @@
 """Vega - Orchestrator agent with DAG-based planning."""
 
+import asyncio
 import time
 import logging
 from datetime import datetime, timezone
@@ -14,6 +15,7 @@ if TYPE_CHECKING:
     from shared.project import ProjectManager
     from shared.conversation import ConversationManager
     from shared.memory import MemoryManager
+    from shared.soul import SoulManager
 
 logger = logging.getLogger(__name__)
 
@@ -31,15 +33,34 @@ You are the brain. You plan, delegate, and synthesize. You NEVER run commands or
 - **Polaris**: Calendar specialist. Google Calendar CRUD, scheduling, time management.
 - **Canopus**: Web specialist. Browser automation, web research, data extraction.
 
+WHEN TO USE PLANS vs DIRECT RESPONSES:
+- **Direct response (NO plan needed)**: Simple greetings, basic facts, questions you can answer from knowledge alone, casual conversation.
+  Examples: "hello", "hi", "who are you?", "what can you do?", "thanks", general knowledge questions.
+  For these, just call `respond_to_user` directly - no create_plan needed.
+
+- **Use create_plan**: Anything requiring agents (CLI, calendar, browser, file ops), multi-step reasoning, or complex coordination.
+
+The graph tools are for COORDINATION, not for every response. Keep it simple when you can.
+
 HOW YOU WORK - JOB GRAPHS:
-You orchestrate work using job DAGs (directed acyclic graphs). For EVERY user request:
-1. Call `create_plan` to build a DAG of tasks with dependencies
+You orchestrate work using job DAGs (directed acyclic graphs).
+
+**IMPORTANT - CHECK FOR EXISTING GRAPHS FIRST:**
+Before creating a new plan, ALWAYS check the "ACTIVE JOB GRAPHS" section below. If there's an active graph for the current conversation:
+1. **Related message?** → Use `add_nodes` to extend the existing graph. Do NOT create a new plan.
+2. **Completely different task?** → OK to create a new plan with `create_plan`.
+3. **Follow-up question while work is in progress?** → Wait for agents or use `add_nodes` to queue follow-up work.
+
+The goal is to keep related work in ONE graph. Only create a new graph when:
+- There are NO active graphs for this channel, OR
+- The user is clearly asking about something COMPLETELY UNRELATED to any active work
+
+**STANDARD FLOW (for tasks requiring agents):**
+1. Check active graphs (below). If related, use `add_nodes`. If not, call `create_plan`.
 2. The system dispatches READY nodes (sends @mentions to agents)
 3. When agents respond, you evaluate results and update nodes
 4. Add more nodes if needed (`add_nodes`), cancel nodes, or re-plan
 5. When the goal is met, call `respond_to_user` with the final answer
-
-Even simple questions should use a plan. A single think→respond DAG is valid.
 
 NODE TYPES:
 - `think`: You reason internally (no external dispatch). Mark complete with `update_node` when done.
@@ -64,8 +85,23 @@ CRITICAL RULES:
 - NEVER duplicate tool actions in your response text
 - When a plan is active and agents respond, evaluate their responses and call `update_node`
 - AFTER marking a node complete, check if remaining PENDING/READY nodes are still needed. If the agent's response already covers their work, cancel them with `cancel_nodes`. Do NOT dispatch redundant work.
-- If you can answer from memory/knowledge alone, use a think→respond plan (no dispatch)
 - Set realistic timeouts. If something will take long, tell the user you're working on it
+- `respond_to_user` is the FINAL answer that ENDS the graph. NEVER use it to ask agents follow-up questions. If you need more info from an agent, use `add_nodes` with a dispatch node instead.
+- To dispatch work to an agent, use the `dispatch` node type (NOT @mentions in respond_to_user text).
+
+HANDLING CANCELLATIONS:
+When the user cancels a task (agent reports "stopped", "cancelled", "permission denied"):
+1. Mark the node as 'cancelled' with `update_node`
+2. ACT IMMEDIATELY - don't wait. Either:
+   - Continue with other nodes that don't depend on the cancelled one
+   - Adapt the plan with `add_nodes` if needed
+   - Or acknowledge the cancellation with `respond_to_user`
+3. Never leave the user hanging after a cancellation - always take action.
+
+MENTIONING USERS & AGENTS:
+When addressing someone by name, use `@Name` format (e.g., `@Sirius`, `@Altair`). This creates a proper Discord mention.
+- In `respond_to_user`: You MAY mention users or agents when it's natural to the conversation (e.g., "Hi @Sirius, nice to meet you!")
+- For dispatching WORK: Always use dispatch nodes, not @mentions in text
 """
 
 
@@ -83,18 +119,23 @@ class VegaAgent(BaseAgent):
         project_manager: Optional["ProjectManager"] = None,
         conversation_manager: Optional["ConversationManager"] = None,
         memory_manager: Optional["MemoryManager"] = None,
+        soul_manager: Optional["SoulManager"] = None,
         discord_bot: Optional["commands.Bot"] = None,
         agent_registry: Optional[dict] = None,
         utility_llm: Optional["LLMProvider"] = None,
+        thinking_llm: Optional["LLMProvider"] = None,
     ):
         super().__init__(
             name="Vega", persona=VEGA_PERSONA, llm=llm, memory_manager=memory_manager,
-            utility_llm=utility_llm,
+            soul_manager=soul_manager, utility_llm=utility_llm, thinking_llm=thinking_llm,
         )
         self.project_manager = project_manager
         self.conversation_manager = conversation_manager
         self.discord_bot = discord_bot
         self.agent_registry = agent_registry or {}
+
+        # Force early tool registration (avoid lazy loading during process())
+        _ = self.tools
 
     def should_handle(self, context: AgentContext) -> float:
         """Vega handles everything directed to her."""
@@ -112,9 +153,10 @@ class VegaAgent(BaseAgent):
         self.agent_registry = agent_registry
 
     def _register_tools(self):
-        """Register Vega's tools - graph orchestration + memory."""
+        """Register Vega's tools - graph orchestration + memory + soul."""
         from vega.tools.graph import get_graph_tools
         from shared.memory.tools import get_memory_tools
+        from shared.soul.tools import get_soul_tools
 
         # Register job graph tools (create_plan, add_nodes, update_node, cancel_nodes, respond_to_user)
         for tool in get_graph_tools():
@@ -129,17 +171,27 @@ class VegaAgent(BaseAgent):
         else:
             logger.info("Memory manager not configured - memory tools unavailable")
 
+        # Register soul tools if soul manager is available
+        if self.soul_manager:
+            for tool in get_soul_tools(self.soul_manager):
+                self._tools.register(tool)
+            logger.info("Registered soul tools for Vega")
+        else:
+            logger.info("Soul manager not configured - soul tools unavailable")
+
     def get_system_prompt(
         self,
         memory_context: Optional[str] = None,
         graph_context: Optional[str] = None,
+        soul_context: Optional[str] = None,
     ) -> str:
         """
-        Build Vega's system prompt with graph state and memory context.
+        Build Vega's system prompt with graph state, soul, and memory context.
 
         Args:
             memory_context: Pre-built memory context string to include
             graph_context: Active job graph state from executor
+            soul_context: Pre-built soul context string (injected before memory)
         """
         tools_desc = self.get_tools_description()
 
@@ -159,10 +211,20 @@ AVAILABLE TOOLS:
 
 ## {graph_context}"""
 
+        # Soul context comes BEFORE memory (who you are > what you know)
+        if soul_context:
+            base_prompt += f"""
+
+## YOUR SOUL (Who You Are):
+{soul_context}
+
+Your personality evolves through experience. Use introspect_soul to reflect on yourself.
+Use evolve_trait when you notice patterns in your behavior."""
+
         if memory_context:
             base_prompt += f"""
 
-## YOUR MEMORIES:
+## YOUR MEMORIES (What You Know):
 {memory_context}
 
 When you learn something important about the user or project, use store_memory to remember it.
@@ -203,16 +265,21 @@ When you need to recall past information, check your active context above or use
         tool_calls_made = 0
 
         try:
-            # Build memory context
-            memory_context_str = await self.build_memory_context(context.message_content)
+            # Build soul context and memory context in parallel
+            # (soul = who you are, memory = what you know)
+            soul_context_str, memory_context_str = await asyncio.gather(
+                self.build_soul_context(),
+                self.build_memory_context(context.message_content),
+            )
 
             # Build graph context (active plans Vega needs to be aware of)
+            # Use channel-specific context to help Vega decide extend vs create new
             graph_context_str = None
             if job_executor:
-                graph_context_str = job_executor.get_all_graphs_context()
+                graph_context_str = job_executor.get_channel_graphs_context(context.channel_id)
 
             # Build conversation history
-            messages = await self._build_messages(context, memory_context_str, graph_context_str)
+            messages = await self._build_messages(context, memory_context_str, graph_context_str, soul_context_str)
 
             # Get tool definitions
             tool_defs = self.tools.get_definitions()
@@ -352,10 +419,11 @@ When you need to recall past information, check your active context above or use
         context: AgentContext,
         memory_context: Optional[str] = None,
         graph_context: Optional[str] = None,
+        soul_context: Optional[str] = None,
     ) -> List[Message]:
         """Build message history for LLM."""
-        # Use memory-enhanced system prompt with graph state
-        system_prompt = self.get_system_prompt(memory_context, graph_context)
+        # Use memory-enhanced system prompt with graph state and soul
+        system_prompt = self.get_system_prompt(memory_context, graph_context, soul_context)
         messages = [Message(role=Role.SYSTEM, content=system_prompt)]
 
         # Fetch recent Discord channel history for conversation context

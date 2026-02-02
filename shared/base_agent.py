@@ -8,6 +8,7 @@ from typing import Optional, List, Dict, Any, TYPE_CHECKING
 if TYPE_CHECKING:
     from shared.llm.interface import LLMProvider
     from shared.tools.registry import ToolRegistry
+    from shared.soul.manager import SoulManager
 
 logger = logging.getLogger(__name__)
 
@@ -60,13 +61,17 @@ class BaseAgent(ABC):
         persona: str,
         llm: 'LLMProvider',
         memory_manager: Optional[Any] = None,
+        soul_manager: Optional['SoulManager'] = None,
         utility_llm: Optional['LLMProvider'] = None,
+        thinking_llm: Optional['LLMProvider'] = None,
     ):
         self.name = name
         self.persona = persona
         self.llm = llm
         self.memory_manager = memory_manager  # Optional MemoryManager for persistent memory
+        self.soul_manager = soul_manager  # Optional SoulManager for personality persistence
         self.utility_llm = utility_llm  # Optional cheaper/faster LLM for quick evaluations
+        self.thinking_llm = thinking_llm  # Optional reasoning LLM for complex tasks
         self._tools: Optional['ToolRegistry'] = None
 
     @property
@@ -145,4 +150,32 @@ class BaseAgent(ABC):
             return memory_context.format_for_prompt()
         except Exception as e:
             logger.warning(f"[{self.name}] Failed to build memory context: {e}")
+            return None
+
+    async def build_soul_context(self, context_tags: Optional[List[str]] = None) -> Optional[str]:
+        """
+        Build soul context string for inclusion in system prompt.
+
+        Soul context represents the agent's personality traits and is injected
+        BEFORE memory context in the prompt.
+
+        Args:
+            context_tags: Optional tags to filter relevant traits
+
+        Returns:
+            Formatted soul context string, or None if no soul manager
+        """
+        if not self.soul_manager:
+            return None
+
+        try:
+            soul_context = await self.soul_manager.build_soul_context(
+                agent_id=self.name.lower(),
+                context_tags=context_tags,
+            )
+            if soul_context.has_traits():
+                return soul_context.format_for_prompt()
+            return None
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to build soul context: {e}")
             return None

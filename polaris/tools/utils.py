@@ -646,7 +646,10 @@ def check_calendar_auth_status(
     token_path: Optional[str] = None,
 ) -> dict:
     """
-    Check the current calendar authentication status without triggering OAuth.
+    Check the current calendar authentication status by actually validating with Google.
+
+    This function will attempt to refresh expired tokens to verify they actually work,
+    rather than just checking if a refresh token exists.
 
     Returns:
         Dict with status info: {
@@ -678,8 +681,9 @@ def check_calendar_auth_status(
         result['message'] = "OAuth not completed. Run `!pauth` to authenticate."
         return result
 
-    # Check if token is valid
+    # Check if token is valid - actually try to refresh if expired
     try:
+        from google.auth.transport.requests import Request
         from google.oauth2.credentials import Credentials
         scopes = ["https://www.googleapis.com/auth/calendar"]
         creds = Credentials.from_authorized_user_file(token_path, scopes)
@@ -688,10 +692,25 @@ def check_calendar_auth_status(
             result['authenticated'] = True
             result['message'] = "Calendar authenticated and ready."
         elif creds.expired and creds.refresh_token:
-            result['authenticated'] = True  # Can be refreshed
-            result['message'] = "Token expired but can be refreshed."
+            # Actually try to refresh to verify it works
+            try:
+                creds.refresh(Request())
+                # Refresh succeeded - save the new token
+                with open(token_path, "w") as token:
+                    token.write(creds.to_json())
+                result['authenticated'] = True
+                result['message'] = "Token refreshed successfully."
+                logger.info("OAuth token refreshed during status check")
+            except Exception as refresh_error:
+                # Refresh failed - token is revoked or invalid
+                error_msg = str(refresh_error)
+                if "invalid_grant" in error_msg:
+                    result['message'] = "Token revoked by Google. Run `!pauth` to re-authenticate."
+                else:
+                    result['message'] = f"Token refresh failed: {error_msg}. Run `!pauth` to re-authenticate."
+                logger.warning(f"OAuth token refresh failed: {refresh_error}")
         else:
-            result['message'] = "Token invalid. Run `!pauth` to re-authenticate."
+            result['message'] = "Token invalid (no refresh token). Run `!pauth` to re-authenticate."
     except Exception as e:
         result['message'] = f"Token check failed: {e}"
 
@@ -768,17 +787,32 @@ def parse_datetime(
         result_date = _parse_date_string(date_str)
 
     # Parse time if provided
+    parsed_tz = None
     if time_str:
-        result_time = _parse_time_string(time_str)
+        result_time, parsed_tz = _parse_time_string(time_str)
     else:
         # Check if time is included in date_str
         time_match = re.search(r"(\d{1,2}):?(\d{2})?\s*(am|pm)?", date_lower, re.I)
         if time_match:
-            result_time = _parse_time_string(time_match.group())
+            result_time, parsed_tz = _parse_time_string(time_match.group())
         else:
             result_time = datetime.min.time()  # Default to midnight
 
-    return datetime.combine(result_date, result_time)
+    # If a timezone was parsed from the time string (e.g., "11:30 AM KST"),
+    # use it instead of the configured default
+    effective_tz = parsed_tz or timezone
+
+    result = datetime.combine(result_date, result_time)
+
+    # Attach timezone info so callers know the effective timezone
+    try:
+        import zoneinfo
+        result_tz = zoneinfo.ZoneInfo(effective_tz)
+        result = result.replace(tzinfo=result_tz)
+    except (ImportError, KeyError):
+        pass
+
+    return result
 
 
 def _parse_date_string(date_str: str) -> "date":
@@ -808,20 +842,56 @@ def _parse_date_string(date_str: str) -> "date":
     raise ValueError(f"Could not parse date: {date_str}")
 
 
-def _parse_time_string(time_str: str) -> "datetime.time":
-    """Parse a time string into a time object."""
+# Map common timezone abbreviations to IANA names
+_TZ_ABBREVIATIONS = {
+    "kst": "Asia/Seoul",
+    "jst": "Asia/Tokyo",
+    "cst": "America/Chicago",
+    "cdt": "America/Chicago",
+    "est": "America/New_York",
+    "edt": "America/New_York",
+    "pst": "America/Los_Angeles",
+    "pdt": "America/Los_Angeles",
+    "mst": "America/Denver",
+    "mdt": "America/Denver",
+    "gmt": "Europe/London",
+    "bst": "Europe/London",
+    "cet": "Europe/Berlin",
+    "cest": "Europe/Berlin",
+    "ist": "Asia/Kolkata",
+    "aest": "Australia/Sydney",
+    "aedt": "Australia/Sydney",
+    "nzst": "Pacific/Auckland",
+    "nzdt": "Pacific/Auckland",
+    "hkt": "Asia/Hong_Kong",
+    "cst_asia": "Asia/Shanghai",
+    "utc": "UTC",
+}
+
+
+def _parse_time_string(time_str: str) -> tuple:
+    """
+    Parse a time string into a time object and optional IANA timezone.
+
+    Handles timezone abbreviations like "11:30 AM KST" by extracting the
+    abbreviation and mapping it to an IANA timezone name.
+
+    Returns:
+        Tuple of (datetime.time, Optional[str]) - the time and IANA timezone if found.
+    """
     import re
 
-    time_str = time_str.strip().lower()
+    time_str = time_str.strip()
 
-    # Match patterns like "2pm", "2:30pm", "14:30", "2:30 PM"
-    match = re.match(r"(\d{1,2}):?(\d{2})?\s*(am|pm)?", time_str, re.I)
+    # Match: digits, optional :minutes, optional am/pm, optional trailing tz abbreviation
+    match = re.match(r"(\d{1,2}):?(\d{2})?\s*(am|pm)?\s*([a-zA-Z]{2,5})?$", time_str, re.I)
     if not match:
         raise ValueError(f"Could not parse time: {time_str}")
 
     hour = int(match.group(1))
     minute = int(match.group(2) or 0)
     ampm = match.group(3)
+    tz_abbr = match.group(4)
 
     if ampm:
         if ampm.lower() == "pm" and hour != 12:
@@ -829,7 +899,12 @@ def _parse_time_string(time_str: str) -> "datetime.time":
         elif ampm.lower() == "am" and hour == 12:
             hour = 0
 
-    return datetime.min.replace(hour=hour, minute=minute).time()
+    # Resolve timezone abbreviation
+    parsed_tz = None
+    if tz_abbr and tz_abbr.lower() not in ("am", "pm"):
+        parsed_tz = _TZ_ABBREVIATIONS.get(tz_abbr.lower())
+
+    return datetime.min.replace(hour=hour, minute=minute).time(), parsed_tz
 
 
 def format_event_for_display(event: Dict[str, Any]) -> str:
