@@ -384,7 +384,7 @@ class PolarisToolContext:
     """
     Context passed to Polaris tool execution.
 
-    Provides access to Google Calendar service and config.
+    Provides access to Google Calendar service, config, and todo/reminder managers.
     """
 
     calendar_service: Optional[Any] = None
@@ -395,6 +395,13 @@ class PolarisToolContext:
 
     # Calendar cache for event lookups
     calendar_cache: Optional[CalendarCache] = None
+
+    # Todo system
+    todo_manager: Optional[Any] = None  # TodoManager
+    reminder_manager: Optional[Any] = None  # ReminderManager
+    calendar_sync_manager: Optional[Any] = None  # CalendarSyncManager
+    adaptation_engine: Optional[Any] = None  # AdaptationEngine
+    notification_manager: Optional[Any] = None  # NotificationManager
 
     # Current context state
     current_channel_id: Optional[int] = None

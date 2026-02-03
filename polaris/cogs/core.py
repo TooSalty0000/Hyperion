@@ -4,7 +4,7 @@ import logging
 from typing import Optional
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from shared.base_agent import AgentContext
 from shared.agent_messaging import AgentMessaging
@@ -44,6 +44,11 @@ class PolarisCore(commands.Cog, AgentAcknowledgmentMixin):
         self.conversation_manager = None
         self.memory_manager = None
         self.soul_manager = None
+        self.todo_manager = None
+        self.reminder_manager = None
+        self.calendar_sync_manager = None
+        self.adaptation_engine = None
+        self.notification_manager = None
 
         # Google Calendar service
         self._calendar_service = None
@@ -83,11 +88,18 @@ class PolarisCore(commands.Cog, AgentAcknowledgmentMixin):
         # Start message queue
         self.message_queue.start()
 
+        # Start reminder checker background task
+        if self.reminder_manager:
+            self.reminder_checker.start()
+            logger.info("Reminder checker background task started")
+
         logger.info("Polaris Core cog initialized successfully")
 
     def cog_unload(self):
         """Clean up when cog is unloaded."""
         self.message_queue.stop()
+        if self.reminder_checker.is_running():
+            self.reminder_checker.cancel()
 
     async def _init_components(self):
         """Initialize all components."""
@@ -104,12 +116,19 @@ class PolarisCore(commands.Cog, AgentAcknowledgmentMixin):
                 from shared.memory import MemoryManager
                 from shared.conversation import ConversationManager
                 from shared.soul import SoulManager, get_default_traits
+                from polaris.todo import TodoManager
+                from polaris.todo.reminders import ReminderManager
                 import asyncio
 
                 self.memory_manager = MemoryManager(self.config.redis_url)
                 self.conversation_manager = ConversationManager(self.config.redis_url)
                 self.soul_manager = SoulManager(self.config.redis_url)
-                logger.info("Memory, conversation, and soul managers initialized")
+                self.todo_manager = TodoManager(self.config.redis_url)
+                self.reminder_manager = ReminderManager(self.config.redis_url)
+
+                from polaris.todo.adaptation import AdaptationEngine
+                self.adaptation_engine = AdaptationEngine(self.config.redis_url)
+                logger.info("Memory, conversation, soul, todo, reminder, and adaptation managers initialized")
 
                 # Initialize default soul traits for Polaris if not already present
                 asyncio.create_task(
@@ -150,6 +169,65 @@ class PolarisCore(commands.Cog, AgentAcknowledgmentMixin):
         # Set calendar service if available
         if self._calendar_service:
             self.agent.set_calendar_service(self._calendar_service)
+
+        # Set todo manager and calendar sync if available
+        if self.todo_manager:
+            self.agent.todo_manager = self.todo_manager
+
+            # Initialize calendar sync manager
+            if self._calendar_service:
+                from polaris.todo.calendar_sync import CalendarSyncManager
+                self.calendar_sync_manager = CalendarSyncManager(
+                    redis_url=self.config.redis_url,
+                    calendar_service=self._calendar_service,
+                    config=self.config,
+                )
+                self.agent.calendar_sync_manager = self.calendar_sync_manager
+                logger.info("Todo manager + calendar sync connected to Polaris agent")
+            else:
+                logger.info("Todo manager connected (calendar sync unavailable - no calendar service)")
+
+        # Set reminder manager if available
+        if self.reminder_manager:
+            self.agent.reminder_manager = self.reminder_manager
+            logger.info("Reminder manager connected to Polaris agent")
+
+        # Set adaptation engine if available
+        if self.adaptation_engine:
+            self.agent.adaptation_engine = self.adaptation_engine
+            # Wire completion tracker into todo manager for automatic tracking
+            if self.todo_manager:
+                self.todo_manager._completion_tracker = self.adaptation_engine.tracker
+            logger.info("Adaptation engine connected to Polaris agent")
+
+        # Initialize notification manager (Discord DM + Web Push)
+        push_service = None
+        if self.config.redis_url:
+            try:
+                from polaris.notifications.push import PushNotificationService
+                from polaris.api.config import get_api_config
+
+                api_config = get_api_config()
+                if api_config.vapid_private_key:
+                    push_service = PushNotificationService(
+                        redis_url=self.config.redis_url,
+                        vapid_private_key=api_config.vapid_private_key,
+                        vapid_public_key=api_config.vapid_public_key,
+                        vapid_subject=api_config.vapid_subject,
+                    )
+                    logger.info("Web Push notification service initialized")
+            except Exception as e:
+                logger.debug(f"Web Push not available: {e}")
+
+        from polaris.notifications.manager import NotificationManager
+        self.notification_manager = NotificationManager(
+            bot=self.bot,
+            push_service=push_service,
+            fallback_user_id=self.config.allowed_user_id,
+            default_channel_id=self.config.main_channel_id,
+        )
+        self.agent.notification_manager = self.notification_manager
+        logger.info("Notification manager connected to Polaris agent")
 
         # Connect workflow state provider to agent
         self.agent.set_workflow_state_provider(self.workflow_state_provider)
@@ -274,9 +352,19 @@ class PolarisCore(commands.Cog, AgentAcknowledgmentMixin):
             return
 
         # Pre-enqueue check: Should we respond at all?
-        # Skip for agent dispatches (always respond to tasks)
-        # Check for casual mentions that don't need a response
-        if not is_from_agent:
+        if is_from_agent:
+            # Check if this is a genuine task dispatch (mention at start)
+            # vs. casual mention in another agent's conversational response.
+            # Real dispatches from the job graph executor always start with
+            # our @mention. Conversational messages embed mentions mid-text.
+            if not self._is_agent_dispatch(message):
+                logger.info(
+                    f"[Polaris] SKIPPING casual agent mention: '{clean_content[:50]}...' - "
+                    f"not a direct dispatch (mention not at start of message)"
+                )
+                return
+        else:
+            # Check for casual mentions from users that don't need a response
             should_respond = await self._should_respond_to_mention(message, clean_content)
             if not should_respond:
                 logger.info(
@@ -496,6 +584,33 @@ class PolarisCore(commands.Cog, AgentAcknowledgmentMixin):
             # On error, default to sending the response
             return True
 
+    def _is_agent_dispatch(self, message: discord.Message) -> bool:
+        """
+        Check if an agent message is a direct task dispatch vs. casual mention.
+
+        Real dispatches from the job graph executor start with the agent's
+        @mention followed by a task description:
+            "<@123456789> check the calendar for tomorrow"
+
+        Conversational messages (e.g., Vega's respond_to_user) embed mentions
+        within natural language:
+            "I'll have <@123456789> check your schedule later"
+
+        Returns True only for direct dispatches.
+        """
+        if not self.bot.user:
+            return True  # Can't check, assume dispatch to be safe
+
+        content = message.content.strip()
+        bot_id = str(self.bot.user.id)
+
+        # Dispatch format: message starts with our @mention
+        # Covers both <@ID> and <@!ID> (nickname) mention formats
+        if content.startswith(f"<@{bot_id}>") or content.startswith(f"<@!{bot_id}>"):
+            return True
+
+        return False
+
     async def _should_respond_to_mention(
         self,
         message: discord.Message,
@@ -510,11 +625,13 @@ class PolarisCore(commands.Cog, AgentAcknowledgmentMixin):
         # Quick pattern checks for obvious cases (save LLM call)
         content_lower = clean_content.lower().strip()
 
-        # Always respond to calendar-related queries
+        # Always respond to calendar or todo-related queries
         if any(word in content_lower for word in [
             "calendar", "schedule", "event", "meeting", "appointment",
             "when", "what time", "free", "busy", "book", "cancel",
             "reschedule", "remind", "today", "tomorrow", "week",
+            "todo", "to-do", "task", "due", "complete", "done",
+            "reminder", "overdue", "priority",
         ]):
             return True
 
@@ -668,6 +785,100 @@ Should Polaris respond to this message? Answer only YES or NO."""
 
         for chunk in chunks:
             await channel.send(chunk, silent=True)
+
+    # === Background Tasks ===
+
+    @tasks.loop(seconds=30)
+    async def reminder_checker(self):
+        """Check for due reminders and send notifications."""
+        if not self.reminder_manager:
+            return
+
+        try:
+            due_reminders = await self.reminder_manager.get_due_reminders()
+            if not due_reminders:
+                return
+
+            for reminder in due_reminders:
+                try:
+                    await self._fire_reminder(reminder)
+                    await self.reminder_manager.mark_fired(reminder.id)
+                except Exception as e:
+                    logger.error(f"Failed to fire reminder {reminder.id}: {e}")
+
+        except Exception as e:
+            logger.error(f"Reminder checker error: {e}", exc_info=True)
+
+    @reminder_checker.before_loop
+    async def before_reminder_checker(self):
+        """Wait for bot to be ready before starting the loop."""
+        await self.bot.wait_until_ready()
+
+    async def _fire_reminder(self, reminder):
+        """Send a reminder notification via NotificationManager."""
+        # Build extra context from linked todo
+        extra_text = ""
+        todo_context = ""
+        if reminder.todo_id and self.todo_manager:
+            todo = await self.todo_manager.get(reminder.todo_id)
+            if todo:
+                parts = [f"Todo: **{todo.title}** [{todo.id}]"]
+                if todo.due_at:
+                    parts.append(f"Due: {todo.due_at.strftime('%b %d %I:%M %p')}")
+                extra_text = "\n".join(parts)
+                todo_context = f"Linked todo: '{todo.title}'"
+                if todo.due_at:
+                    todo_context += f" (due {todo.due_at.strftime('%b %d %I:%M %p')})"
+
+        # Generate natural reminder text via utility LLM
+        formatted_text = ""
+        if self.agent and self.agent.utility_llm:
+            try:
+                from shared.llm.types import Message, Role
+
+                snooze_info = ""
+                if getattr(reminder, 'snooze_count', 0) > 0:
+                    snooze_info = f"\nThis reminder has been snoozed {reminder.snooze_count} time(s)."
+
+                prompt = (
+                    f"Write a short, friendly Discord reminder message (1-2 sentences). "
+                    f"Do NOT use markdown bold on the word 'Reminder'. "
+                    f"Be natural and conversational.\n\n"
+                    f"Reminder: {reminder.message}\n"
+                    f"{todo_context}\n"
+                    f"{snooze_info}\n"
+                    f"Write ONLY the reminder text, nothing else."
+                )
+
+                response = await self.agent.utility_llm.generate(
+                    messages=[Message(role=Role.USER, content=prompt)],
+                    temperature=0.7,
+                    max_tokens=150,
+                )
+                if response.content and response.content.strip():
+                    formatted_text = response.content.strip()
+                    logger.debug(f"LLM-generated reminder text for {reminder.id}: {formatted_text}")
+            except Exception as e:
+                logger.warning(f"LLM reminder generation failed for {reminder.id}: {e}")
+
+        if self.notification_manager:
+            results = await self.notification_manager.send_reminder(
+                reminder, extra_text=extra_text, formatted_text=formatted_text,
+            )
+            logger.info(f"Fired reminder {reminder.id}: {results}")
+        else:
+            # Fallback: direct DM if notification manager not available
+            user_id = int(reminder.user_id) if reminder.user_id.isdigit() else None
+            if user_id:
+                try:
+                    user = await self.bot.fetch_user(user_id)
+                    if user:
+                        text = formatted_text or f"**Reminder:** {reminder.message}"
+                        if extra_text:
+                            text = f"{text}\n{extra_text}"
+                        await user.send(text)
+                except Exception as e:
+                    logger.error(f"Failed to send fallback DM for reminder {reminder.id}: {e}")
 
     # === Commands ===
 

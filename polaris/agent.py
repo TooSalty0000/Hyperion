@@ -53,18 +53,29 @@ RESPONSE FORMAT:
 
 ROLE:
 - You manage Google Calendar events for the user
-- You can create, update, delete, and list calendar events
+- You manage the user's todo list (create, update, complete, delete todos)
 - You can find free time slots for scheduling meetings
 - You understand working hours and time zone preferences
 - You proactively warn about scheduling conflicts
+- You can schedule todos as calendar events
 
 CAPABILITIES:
+Calendar:
 - Create events with title, time, duration, location, and description
 - List upcoming events for a specific time range
 - Find free time slots within working hours
 - Update existing events (reschedule, change details)
 - Delete/cancel events
 - Check for conflicts before scheduling
+
+Todos:
+- Create todos with title, priority, due date, tags, and project
+- List todos with filters (status, priority, project, tag)
+- Update any todo field (title, description, priority, due date, status)
+- Complete and delete todos
+- Get a summary/dashboard of all todos
+- Schedule todos as calendar events
+- Set reminders for todos with due dates
 
 SCHEDULING BEST PRACTICES:
 - Always confirm the date and time before creating events
@@ -93,10 +104,10 @@ TOOL USAGE:
 - NEVER batch multiple calendar operations (e.g. list + create) in a single iteration.
 - This ensures you see each result before deciding the next action.
 
-WHEN TO DELEGATE:
-- For project management tasks, suggest @Altair
-- For strategic planning or discussions, suggest @Vega
-- You focus specifically on calendar and time management
+INTER-AGENT COORDINATION:
+- Include ALL findings in your response text. Vega handles all inter-agent coordination.
+- Do NOT try to @mention other agents - just respond with your results.
+- You focus specifically on calendar and time management.
 
 WHEN TO NOT REPLY (CRITICAL - READ CAREFULLY):
 Sometimes the best response is NO response. Do NOT reply when:
@@ -162,6 +173,9 @@ class PolarisAgent(BaseAgent):
         r"\b(when|what time|what's on)\b.*\b(calendar|schedule|free)\b",
         r"\b(today|tomorrow|next week|this week)\b.*\b(schedule|calendar|free)\b",
         r"\b(set up|arrange|plan)\s+(a\s+)?(call|meeting|sync)\b",
+        r"\b(todo|task|to-do|to do)\b",
+        r"\b(remind|reminder|due)\b",
+        r"\b(complete|finish|done|mark)\s+(the\s+)?(todo|task)\b",
     ]
 
     def __init__(
@@ -194,6 +208,13 @@ class PolarisAgent(BaseAgent):
         # Calendar cache for event lookups (scratchpad for recent fetches)
         from polaris.tools.utils import CalendarCache
         self._calendar_cache = CalendarCache()
+
+        # Todo system managers (set externally by cog)
+        self.todo_manager = None
+        self.reminder_manager = None
+        self.calendar_sync_manager = None
+        self.adaptation_engine = None
+        self.notification_manager = None
 
         # Workflow state provider for context awareness
         self._workflow_state_provider: Optional[WorkflowStateProvider] = None
@@ -228,7 +249,7 @@ class PolarisAgent(BaseAgent):
         return None
 
     def _register_tools(self):
-        """Register Polaris's calendar tools."""
+        """Register Polaris's calendar and todo tools."""
         from polaris.tools.calendar_ops import (
             CreateEventTool,
             ListEventsTool,
@@ -238,6 +259,14 @@ class PolarisAgent(BaseAgent):
         from polaris.tools.scheduling import (
             FindFreeSlotsTool,
             CheckConflictsTool,
+        )
+        from polaris.tools.todo_ops import (
+            CreateTodoTool,
+            ListTodosTool,
+            UpdateTodoTool,
+            CompleteTodoTool,
+            DeleteTodoTool,
+            GetTodoSummaryTool,
         )
         from shared.memory.tools import get_memory_tools
 
@@ -251,18 +280,30 @@ class PolarisAgent(BaseAgent):
         self._tools.register(FindFreeSlotsTool())
         self._tools.register(CheckConflictsTool())
 
-        # Inter-agent communication tool (for delegating tasks)
-        if self.discord_bot and self.agent_registry:
-            from vega.tools.mention import MentionAgentTool
+        # Todo tools
+        self._tools.register(CreateTodoTool())
+        self._tools.register(ListTodosTool())
+        self._tools.register(UpdateTodoTool())
+        self._tools.register(CompleteTodoTool())
+        self._tools.register(DeleteTodoTool())
+        self._tools.register(GetTodoSummaryTool())
 
-            self._tools.register(
-                MentionAgentTool(
-                    bot=self.discord_bot,
-                    agent_registry=self.agent_registry,
-                    own_agent_name="polaris",
-                )
-            )
-            logger.info("Registered MentionAgentTool for agent delegation")
+        # Todo scheduling tools (calendar integration)
+        from polaris.tools.todo_scheduling import ScheduleTodoTool, UnscheduleTodoTool
+        self._tools.register(ScheduleTodoTool())
+        self._tools.register(UnscheduleTodoTool())
+
+        # Reminder tools
+        from polaris.tools.reminder_ops import (
+            SetReminderTool,
+            ListRemindersTool,
+            SnoozeReminderTool,
+            DismissReminderTool,
+        )
+        self._tools.register(SetReminderTool())
+        self._tools.register(ListRemindersTool())
+        self._tools.register(SnoozeReminderTool())
+        self._tools.register(DismissReminderTool())
 
         # Register memory tools if memory manager is available
         if self.memory_manager:
@@ -408,6 +449,11 @@ When you learn scheduling preferences or recurring patterns, use store_memory to
                 memory_manager=self.memory_manager,
                 discord_bot=self.discord_bot,
                 calendar_cache=self._calendar_cache,
+                todo_manager=self.todo_manager,
+                reminder_manager=self.reminder_manager,
+                calendar_sync_manager=self.calendar_sync_manager,
+                adaptation_engine=self.adaptation_engine,
+                notification_manager=self.notification_manager,
                 current_channel_id=context.channel_id,
                 current_guild_id=context.guild_id,
                 user_id=context.user_id,
