@@ -11,20 +11,20 @@
 
 services:
   # Redis - Shared state for distributed operation
-  redis:
-    image: redis:7-alpine
-    container_name: hyperion-redis
-    restart: unless-stopped
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis-data:/data
-    command: redis-server --appendonly yes
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: hyperion-redis
+  #   restart: unless-stopped
+  #   ports:
+  #     - "6379:6379"
+  #   volumes:
+  #     - redis-data:/data
+  #   command: redis-server --appendonly yes
+  #   healthcheck:
+  #     test: ["CMD", "redis-cli", "ping"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
 
   # Vega - Head conversational agent
   vega:
@@ -33,43 +33,43 @@ services:
       dockerfile: vega/Dockerfile
     container_name: hyperion-vega
     restart: unless-stopped
-    depends_on:
-      redis:
-        condition: service_healthy
+    # depends_on:
+    # redis:
+    #   condition: service_healthy
     env_file:
       - .env
-    environment:
-      - REDIS_URL=redis://redis:6379
-      # Override these in .env or here:
-      # - DISCORD_TOKEN=${VEGA_DISCORD_TOKEN}
-      # - LLM_PROVIDER=${VEGA_LLM_PROVIDER:-gemini}
-      # - LLM_API_KEY=${VEGA_LLM_API_KEY}
-      # - LLM_MODEL=${VEGA_LLM_MODEL:-gemini-2.0-flash}
+    # environment:
+    # - REDIS_URL=redis://redis:6379
+    # Override these in .env or here:
+    # - DISCORD_TOKEN=${VEGA_DISCORD_TOKEN}
+    # - LLM_PROVIDER=${VEGA_LLM_PROVIDER:-gemini}
+    # - LLM_API_KEY=${VEGA_LLM_API_KEY}
+    # - LLM_MODEL=${VEGA_LLM_MODEL:-gemini-2.0-flash}
 
   # Altair - CLI/Terminal specialist
-  altair:
-    build:
-      context: .
-      dockerfile: altair/Dockerfile
-    container_name: hyperion-altair
-    restart: unless-stopped
-    depends_on:
-      redis:
-        condition: service_healthy
-    env_file:
-      - .env
-    environment:
-      - REDIS_URL=redis://redis:6379
-      - TERMINAL_BACKEND=tmux
-      # Override these in .env or here:
-      # - ALTAIR_DISCORD_TOKEN=${ALTAIR_DISCORD_TOKEN}
-      # - ALTAIR_LLM_PROVIDER=${ALTAIR_LLM_PROVIDER:-gemini}
-      # - ALTAIR_LLM_API_KEY=${ALTAIR_LLM_API_KEY}
-    volumes:
-      # Persist session data
-      - altair-sessions:/root/.hyperion
-      # Optional: Mount workspace for CLI access
-      # - ./workspace:/workspace
+  # altair:
+  #   build:
+  #     context: .
+  #     dockerfile: altair/Dockerfile
+  #   container_name: hyperion-altair
+  #   restart: unless-stopped
+  #   depends_on:
+  #     redis:
+  #       condition: service_healthy
+  #   env_file:
+  #     - .env
+  #   environment:
+  #     - REDIS_URL=redis://redis:6379
+  #     - TERMINAL_BACKEND=tmux
+  #     # Override these in .env or here:
+  #     # - ALTAIR_DISCORD_TOKEN=${ALTAIR_DISCORD_TOKEN}
+  #     # - ALTAIR_LLM_PROVIDER=${ALTAIR_LLM_PROVIDER:-gemini}
+  #     # - ALTAIR_LLM_API_KEY=${ALTAIR_LLM_API_KEY}
+  #   volumes:
+  #     # Persist session data
+  #     - altair-sessions:/root/.hyperion
+  #     # Optional: Mount workspace for CLI access
+  #     # - ./workspace:/workspace
 
   # Polaris - Calendar/Scheduling agent
   polaris:
@@ -78,17 +78,17 @@ services:
       dockerfile: polaris/Dockerfile
     container_name: hyperion-polaris
     restart: unless-stopped
-    depends_on:
-      redis:
-        condition: service_healthy
+    # depends_on:
+    # redis:
+    #   condition: service_healthy
     env_file:
       - .env
-    environment:
-      - REDIS_URL=redis://redis:6379
-      # Override these in .env or here:
-      # - POLARIS_DISCORD_TOKEN=${POLARIS_DISCORD_TOKEN}
-      # - POLARIS_LLM_PROVIDER=${POLARIS_LLM_PROVIDER:-gemini}
-      # - POLARIS_LLM_API_KEY=${POLARIS_LLM_API_KEY}
+    # environment:
+    # - REDIS_URL=redis://redis:6379
+    # Override these in .env or here:
+    # - POLARIS_DISCORD_TOKEN=${POLARIS_DISCORD_TOKEN}
+    # - POLARIS_LLM_PROVIDER=${POLARIS_LLM_PROVIDER:-gemini}
+    # - POLARIS_LLM_API_KEY=${POLARIS_LLM_API_KEY}
 
   # Canopus - Web browser agent
   canopus:
@@ -97,23 +97,23 @@ services:
       dockerfile: canopus/Dockerfile
     container_name: hyperion-canopus
     restart: unless-stopped
-    depends_on:
-      redis:
-        condition: service_healthy
+    # depends_on:
+    # redis:
+    #   condition: service_healthy
     env_file:
       - .env
-    environment:
-      - REDIS_URL=redis://redis:6379
-      # Override these in .env or here:
-      # - CANOPUS_DISCORD_TOKEN=${CANOPUS_DISCORD_TOKEN}
-      # - CANOPUS_LLM_PROVIDER=${CANOPUS_LLM_PROVIDER:-gemini}
-      # - CANOPUS_LLM_API_KEY=${CANOPUS_LLM_API_KEY}
+    # environment:
+    # - REDIS_URL=redis://redis:6379
+    # Override these in .env or here:
+    # - CANOPUS_DISCORD_TOKEN=${CANOPUS_DISCORD_TOKEN}
+    # - CANOPUS_LLM_PROVIDER=${CANOPUS_LLM_PROVIDER:-gemini}
+    # - CANOPUS_LLM_API_KEY=${CANOPUS_LLM_API_KEY}
     # Canopus needs more memory for browser automation
     deploy:
       resources:
         limits:
           memory: 2G
 
-volumes:
-  redis-data:
-  altair-sessions:
+# volumes:
+# redis-data:
+# altair-sessions:

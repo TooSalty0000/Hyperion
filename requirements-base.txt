@@ -1,0 +1,10 @@
+# Shared dependencies for all agents
+discord.py
+python-dotenv
+
+# LLM Providers
+google-genai  # For Gemini
+ollama>=0.4.0  # For Ollama (local models)
+
+# Redis (optional - enables persistence features)
+redis

@@ -244,40 +244,11 @@ async def main(
     if run_vega:
         try:
             from vega.config import get_config as get_vega_config
+            from vega.bot import VegaBot
 
             vega_config = get_vega_config()
             if vega_config.discord_token:
-                # Import and create Vega bot
-                intents = discord.Intents.default()
-                intents.message_content = True
-                intents.reactions = True
-                intents.guilds = True
-
-                vega_bot = commands.Bot(
-                    command_prefix="!",
-                    intents=intents,
-                )
-
-                @vega_bot.event
-                async def on_ready():
-                    logger.info(f"Vega connected as {vega_bot.user}")
-                    # Populate member cache from all guilds
-                    from shared.discord_utils import get_member_cache
-                    cache = get_member_cache()
-                    cache.populate_from_guilds(vega_bot.guilds)
-
-                @vega_bot.event
-                async def on_command_error(ctx, error):
-                    # Silently ignore command not found - handled via on_message
-                    if isinstance(error, commands.CommandNotFound):
-                        return
-                    logger.error(f"Vega command error: {error}")
-
-                # Load Vega cog
-                async def setup_vega():
-                    await vega_bot.load_extension("vega.cogs.core")
-
-                vega_bot.setup_hook = setup_vega
+                vega_bot = VegaBot()
                 manager.add_bot("Vega", vega_bot, vega_config.discord_token)
             else:
                 logger.warning("DISCORD_TOKEN not set, skipping Vega")
