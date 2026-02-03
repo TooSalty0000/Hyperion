@@ -6,7 +6,7 @@ import os
 from typing import Optional
 
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 
 from vega.config import Config
 from vega.agents import VegaAgent, AgentContext
@@ -16,6 +16,7 @@ from shared.agent_coordinator import (
     AgentAcknowledgmentMixin,
 )
 from shared.discord_utils import is_from_known_agent, convert_text_mentions_to_discord
+from shared.agent_messaging import parse_node_marker, strip_node_marker
 from shared.job_graph.executor import JobGraphExecutor
 
 logger = logging.getLogger(__name__)
@@ -158,12 +159,13 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
                 )
                 logger.info("Distributed agent tracker initialized")
 
-            # Initialize job graph executor
+            # Initialize job graph executor with per-node timeout callback
             max_timeout = int(os.environ.get("JOB_MAX_TIMEOUT", "600"))
             self.executor = JobGraphExecutor(
                 bot=self.bot,
                 agent_registry=self._agent_registry,
                 max_timeout=max_timeout,
+                on_timeout_callback=self._handle_node_timeout,
             )
 
             # Give executor access to channel manager for meeting room creation
@@ -193,57 +195,40 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
 
     def cog_unload(self):
         self.message_queue.stop()
-        self.timeout_checker.cancel()
 
     # --------------------------------------------------
-    # TIMEOUT CHECKER - periodic task
+    # NODE TIMEOUT CALLBACK
     # --------------------------------------------------
 
-    @tasks.loop(seconds=15)
-    async def timeout_checker(self):
-        """Check for timed-out graph nodes and trigger re-evaluation."""
-        if not self.executor:
+    async def _handle_node_timeout(self, graph, node) -> None:
+        """
+        Called by the executor's per-node timeout task when a node times out.
+
+        Enqueues a re-evaluation context for Vega to decide: retry, reassign, or fail.
+        """
+        if not self.vega_agent:
             return
 
         try:
-            timed_out = self.executor.check_timeouts()
-            for graph, node in timed_out:
-                logger.warning(
-                    f"[Vega] Node '{node.id}' timed out in graph '{graph.id}' "
-                    f"(agent={node.agent}, timeout={node.timeout}s)"
-                )
-                # Post timeout embed to thread
-                try:
-                    await self.executor._post_timeout_embed(graph, node)
-                except Exception as embed_err:
-                    logger.error(f"[Vega] Failed to post timeout embed: {embed_err}")
-
-                # Trigger Vega re-evaluation with the timeout context
-                channel = self.bot.get_channel(graph.channel_id)
-                if channel and self.vega_agent:
-                    try:
-                        context = AgentContext(
-                            channel_id=graph.channel_id,
-                            user_id=0,  # System-triggered
-                            message_content=f"[SYSTEM] Node '{node.id}' (agent: {node.agent}) timed out. Evaluate and decide: retry, reassign, or fail the goal.",
-                            conversation_id=await self._get_or_create_conversation(
-                                channel_id=graph.channel_id,
-                                user_id=0,
-                            ),
-                        )
-                        await self.message_queue.enqueue(
-                            message=None,
-                            context=context,
-                            is_from_agent=False,
-                        )
-                    except Exception as enqueue_err:
-                        logger.error(f"[Vega] Failed to enqueue timeout re-evaluation: {enqueue_err}")
-        except Exception as e:
-            logger.error(f"[Vega] timeout_checker error: {e}", exc_info=True)
-
-    @timeout_checker.before_loop
-    async def before_timeout_checker(self):
-        await self.bot.wait_until_ready()
+            context = AgentContext(
+                channel_id=graph.channel_id,
+                user_id=0,  # System-triggered
+                message_content=(
+                    f"[SYSTEM] Node '{node.id}' (agent: {node.agent}) timed out. "
+                    f"Evaluate and decide: retry, reassign, or fail the goal."
+                ),
+                conversation_id=await self._get_or_create_conversation(
+                    channel_id=graph.channel_id,
+                    user_id=0,
+                ),
+            )
+            await self.message_queue.enqueue(
+                message=None,
+                context=context,
+                is_from_agent=False,
+            )
+        except Exception as enqueue_err:
+            logger.error(f"[Vega] Failed to enqueue timeout re-evaluation: {enqueue_err}")
 
     # --------------------------------------------------
     # MESSAGE HANDLER
@@ -361,8 +346,20 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
 
         channel_id = message.channel.id
 
-        # Find the graph node this response corresponds to
-        match = self.executor.find_node_for_agent_response(agent_name, channel_id)
+        # Try marker-based O(1) lookup first
+        match = None
+        marker_parsed = parse_node_marker(message.content)
+        if marker_parsed:
+            graph_id, node_id = marker_parsed
+            match = self.executor.find_node_by_marker(graph_id, node_id, channel_id)
+            if match:
+                logger.info(f"[Vega] Marker match: graph={graph_id}, node={node_id}")
+
+        # Fall back to FIFO matching if no marker or marker didn't match
+        if not match:
+            match = self.executor.find_node_for_agent_response(agent_name, channel_id)
+            if match:
+                logger.info(f"[Vega] FIFO match (no marker): node={match[1].id}")
 
         if not match:
             logger.debug(
@@ -372,6 +369,10 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
             return False
 
         graph, node = match
+
+        # Cancel the per-node timeout task
+        self.executor.cancel_timeout(graph.id, node.id)
+
         logger.info(
             f"[Vega] Agent '{agent_name}' responded to node '{node.id}' "
             f"in graph '{graph.id}'"
@@ -397,8 +398,18 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
             user_id=0,
         )
 
-        # Include the agent's actual response for Vega to evaluate
-        agent_response_content = message.content[:1500] if message.content else "(no content)"
+        # Include the agent's actual response for Vega to evaluate.
+        # Strip the @Vega mention and node marker so the LLM sees clean content.
+        raw_content = message.content or ""
+        clean_agent_content = strip_node_marker(raw_content)
+        # Strip @Vega mention
+        if self.bot.user:
+            clean_agent_content = clean_agent_content.replace(
+                f"<@{self.bot.user.id}>", ""
+            ).replace(
+                f"<@!{self.bot.user.id}>", ""
+            ).strip()
+        agent_response_content = clean_agent_content[:1500] if clean_agent_content else "(no content)"
 
         # Detect if this is a cancellation/abort response
         is_cancelled = any(phrase in agent_response_content.lower() for phrase in [
@@ -600,5 +611,3 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
 async def setup(bot):
     cog = VegaCore(bot)
     await bot.add_cog(cog)
-    # Start the timeout checker after cog is added
-    cog.timeout_checker.start()

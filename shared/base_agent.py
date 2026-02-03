@@ -26,6 +26,7 @@ class AgentContext:
     project_name: Optional[str] = None
     session_id: Optional[int] = None
     is_from_agent: bool = False  # True when dispatched by another agent (e.g. Vega)
+    node_marker: Optional[str] = None  # e.g. "[node:abc12345:n1]" from dispatch message
 
 
 @dataclass

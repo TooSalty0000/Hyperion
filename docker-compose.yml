@@ -102,12 +102,9 @@ services:
     #   condition: service_healthy
     env_file:
       - .env
-    # environment:
-    # - REDIS_URL=redis://redis:6379
-    # Override these in .env or here:
-    # - CANOPUS_DISCORD_TOKEN=${CANOPUS_DISCORD_TOKEN}
-    # - CANOPUS_LLM_PROVIDER=${CANOPUS_LLM_PROVIDER:-gemini}
-    # - CANOPUS_LLM_API_KEY=${CANOPUS_LLM_API_KEY}
+    environment:
+      # Force headless mode in Docker (no X server available)
+      - CANOPUS_HEADLESS=true
     # Canopus needs more memory for browser automation
     deploy:
       resources:

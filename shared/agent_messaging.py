@@ -1,11 +1,44 @@
 """Inter-agent communication via Discord @mentions."""
 
+import re
 import logging
 from typing import Optional, Dict, Any
 
 import discord
 
 logger = logging.getLogger(__name__)
+
+# --------------------------------------------------
+# NODE MARKER UTILITIES
+# --------------------------------------------------
+
+# Matches [node:graph_id:node_id] anywhere in text
+NODE_MARKER_RE = re.compile(r"\[node:([A-Za-z0-9_-]+):([A-Za-z0-9_-]+)\]")
+
+
+def format_node_marker(graph_id: str, node_id: str) -> str:
+    """Format a node marker string for embedding in dispatch/response messages."""
+    return f"[node:{graph_id}:{node_id}]"
+
+
+def parse_node_marker(content: str) -> Optional[tuple[str, str]]:
+    """
+    Extract (graph_id, node_id) from text containing a node marker.
+
+    Returns None if no marker is found.
+    """
+    match = NODE_MARKER_RE.search(content)
+    if match:
+        return (match.group(1), match.group(2))
+    return None
+
+
+def strip_node_marker(content: str) -> str:
+    """Remove node marker from text, collapsing extra whitespace."""
+    result = NODE_MARKER_RE.sub("", content)
+    # Collapse runs of spaces (but preserve newlines)
+    result = re.sub(r" {2,}", " ", result)
+    return result.strip()
 
 
 class AgentMessaging:

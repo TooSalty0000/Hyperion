@@ -341,6 +341,9 @@ class UpdateNodeTool(Tool):
         else:
             return f"Error: Invalid status '{status}'."
 
+        # Cancel the per-node timeout task (if any)
+        executor.cancel_timeout(graph_id, node_id)
+
         # Dispatch any newly ready nodes
         dispatched = await executor.dispatch_ready_nodes(graph)
 

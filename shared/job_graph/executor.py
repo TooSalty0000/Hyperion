@@ -2,12 +2,13 @@
 
 import asyncio
 import logging
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, Callable, Awaitable, TYPE_CHECKING
 
 import discord
 from discord.ext import commands
 
 from .models import JobGraph, JobNode, NodeType, NodeStatus, GraphStatus
+from shared.agent_messaging import format_node_marker
 
 if TYPE_CHECKING:
     from shared.channel.manager import ChannelManager
@@ -40,10 +41,12 @@ class JobGraphExecutor:
         bot: commands.Bot,
         agent_registry: dict[str, int],
         max_timeout: int = 600,
+        on_timeout_callback: Optional[Callable[[JobGraph, JobNode], Awaitable[None]]] = None,
     ):
         self.bot = bot
         self.agent_registry = agent_registry
         self.max_timeout = max_timeout
+        self._on_timeout_callback = on_timeout_callback
 
         # Active graphs: channel_id → list of graphs (multiple can be active)
         self._graphs: dict[int, list[JobGraph]] = {}
@@ -53,6 +56,9 @@ class JobGraphExecutor:
 
         # Project channel (meeting room) → graph mapping
         self._project_channel_to_graph: dict[int, JobGraph] = {}
+
+        # Per-node timeout tasks: "graph_id:node_id" → asyncio.Task
+        self._timeout_tasks: dict[str, asyncio.Task] = {}
 
         # Channel manager for creating/deleting meeting rooms (set by VegaCore)
         self.channel_manager: Optional["ChannelManager"] = None
@@ -166,9 +172,10 @@ class JobGraphExecutor:
             graph.mark_failed(node.id, "Channel not found")
             return False
 
-        # Build the mention message
+        # Build the mention message with node marker for response matching
         mention = f"<@{agent_id}>"
-        message_content = f"{mention} {node.description}"
+        marker = format_node_marker(graph.id, node.id)
+        message_content = f"{mention} {marker} {node.description}"
 
         try:
             sent_msg = await channel.send(message_content, silent=True)
@@ -177,6 +184,9 @@ class JobGraphExecutor:
                 f"[Executor] Dispatched node {node.id} to {node.agent}: "
                 f"{node.description[:50]}..."
             )
+
+            # Schedule per-node timeout
+            self._schedule_timeout(graph, node)
 
             # Post dispatch embed to thread
             await self._post_dispatch_embed(graph, node)
@@ -190,6 +200,9 @@ class JobGraphExecutor:
         """
         Check all active graphs for timed-out nodes.
 
+        DEPRECATED: Retained for backward compatibility. Per-node asyncio timeout
+        tasks now handle timeouts directly via _schedule_timeout().
+
         Returns:
             List of (graph, node) tuples for nodes that timed out
         """
@@ -202,6 +215,91 @@ class JobGraphExecutor:
                     graph.mark_failed(node.id, f"Timed out after {node.timeout}s")
                     timed_out.append((graph, node))
         return timed_out
+
+    # --------------------------------------------------
+    # PER-NODE TIMEOUT TASKS
+    # --------------------------------------------------
+
+    def _schedule_timeout(self, graph: JobGraph, node: JobNode) -> None:
+        """Schedule an asyncio task that fires after node.timeout seconds."""
+        key = f"{graph.id}:{node.id}"
+
+        async def _timeout_coro():
+            try:
+                await asyncio.sleep(node.timeout)
+                # Re-check: node may have been completed/cancelled while sleeping
+                if node.status != NodeStatus.RUNNING:
+                    return
+                graph.mark_failed(node.id, f"Timed out after {node.timeout}s")
+                logger.warning(
+                    f"[Executor] Node '{node.id}' timed out in graph '{graph.id}' "
+                    f"(agent={node.agent}, timeout={node.timeout}s)"
+                )
+                # Post timeout embed
+                try:
+                    await self._post_timeout_embed(graph, node)
+                except Exception as embed_err:
+                    logger.error(f"[Executor] Failed to post timeout embed: {embed_err}")
+                # Fire callback (Vega re-evaluation)
+                if self._on_timeout_callback:
+                    try:
+                        await self._on_timeout_callback(graph, node)
+                    except Exception as cb_err:
+                        logger.error(f"[Executor] Timeout callback error: {cb_err}")
+            except asyncio.CancelledError:
+                pass  # Normal cancellation when agent responds in time
+            finally:
+                self._timeout_tasks.pop(key, None)
+
+        task = asyncio.create_task(_timeout_coro())
+        self._timeout_tasks[key] = task
+        logger.debug(f"[Executor] Scheduled {node.timeout}s timeout for {key}")
+
+    def cancel_timeout(self, graph_id: str, node_id: str) -> None:
+        """Cancel a specific node's timeout task."""
+        key = f"{graph_id}:{node_id}"
+        task = self._timeout_tasks.pop(key, None)
+        if task and not task.done():
+            task.cancel()
+            logger.debug(f"[Executor] Cancelled timeout for {key}")
+
+    def cancel_all_timeouts(self, graph_id: str) -> None:
+        """Cancel all timeout tasks for a graph."""
+        prefix = f"{graph_id}:"
+        keys_to_remove = [k for k in self._timeout_tasks if k.startswith(prefix)]
+        for key in keys_to_remove:
+            task = self._timeout_tasks.pop(key, None)
+            if task and not task.done():
+                task.cancel()
+        if keys_to_remove:
+            logger.debug(f"[Executor] Cancelled {len(keys_to_remove)} timeouts for graph {graph_id}")
+
+    # --------------------------------------------------
+    # MARKER-BASED NODE LOOKUP
+    # --------------------------------------------------
+
+    def find_node_by_marker(
+        self,
+        graph_id: str,
+        node_id: str,
+        channel_id: int,
+    ) -> Optional[tuple[JobGraph, JobNode]]:
+        """
+        O(1) lookup of a running DISPATCH node by graph_id + node_id.
+
+        Falls through if the node is not RUNNING (already completed/failed).
+        """
+        # Search graphs in the given channel and project channels
+        for graphs in self._graphs.values():
+            for graph in graphs:
+                if graph.id != graph_id:
+                    continue
+                if graph.status != GraphStatus.ACTIVE:
+                    continue
+                node = graph.nodes.get(node_id)
+                if node and node.status == NodeStatus.RUNNING and node.type == NodeType.DISPATCH:
+                    return (graph, node)
+        return None
 
     def find_node_for_agent_response(
         self,
@@ -313,6 +411,9 @@ class JobGraphExecutor:
         """Mark a graph as completed and delete the planning thread and meeting room."""
         graph.status = GraphStatus.COMPLETED
 
+        # Cancel any remaining timeout tasks for this graph
+        self.cancel_all_timeouts(graph.id)
+
         # Post completion embed then delete the thread
         await self._post_completion_embed(graph, success=True)
         await self._delete_thread(graph)
@@ -325,6 +426,9 @@ class JobGraphExecutor:
     async def fail_graph(self, graph: JobGraph) -> None:
         """Mark a graph as failed and delete the planning thread and meeting room."""
         graph.status = GraphStatus.FAILED
+
+        # Cancel any remaining timeout tasks for this graph
+        self.cancel_all_timeouts(graph.id)
 
         # Post failure embed then delete the thread
         await self._post_completion_embed(graph, success=False)

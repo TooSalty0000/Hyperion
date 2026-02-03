@@ -9,7 +9,7 @@ import discord
 from discord.ext import commands, tasks
 
 from shared.base_agent import AgentContext
-from shared.agent_messaging import AgentMessaging
+from shared.agent_messaging import AgentMessaging, parse_node_marker, strip_node_marker
 from shared.discord_utils import convert_text_mentions_to_discord
 from shared.agent_queue import AgentMessageQueue
 from shared.channel import ChannelManager
@@ -449,6 +449,16 @@ class AltairCore(commands.Cog, AgentAcknowledgmentMixin):
                 )
                 return
 
+        # Extract node marker from dispatch content (if present)
+        node_marker = None
+        if is_from_agent:
+            parsed = parse_node_marker(clean_content)
+            if parsed:
+                from shared.agent_messaging import format_node_marker
+                node_marker = format_node_marker(*parsed)
+                clean_content = strip_node_marker(clean_content)
+                logger.info(f"[Altair] Extracted node marker: {node_marker}")
+
         # Log who we received message from
         if is_from_agent:
             sender_agent = self.agent_messaging.is_from_agent(message)
@@ -489,6 +499,7 @@ class AltairCore(commands.Cog, AgentAcknowledgmentMixin):
             mentioned_agent="altair",
             conversation_id=conversation_id,
             is_from_agent=is_from_agent,
+            node_marker=node_marker,
         )
 
         # Add to queue for sequential processing
@@ -556,6 +567,12 @@ class AltairCore(commands.Cog, AgentAcknowledgmentMixin):
 
         # Send response only if there's content AND response is still relevant
         if response.content and should_send:
+            # Prepend @Vega + node marker so Vega can match this to the graph node
+            if is_from_agent and context.node_marker:
+                vega_id = self.config.agent_registry.agents.get("vega")
+                if vega_id:
+                    response.content = f"<@{vega_id}> {context.node_marker} {response.content}"
+
             logger.info(
                 f"[Altair] SENDING RESPONSE: msg_id={message.id}, "
                 f"response_len={len(response.content)}, tool_calls={response.tool_calls_made}, "
