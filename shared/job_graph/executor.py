@@ -216,6 +216,37 @@ class JobGraphExecutor:
         candidates.sort(key=lambda x: x[1].dispatched_at or x[1].created_at)
         return candidates[0]
 
+    def find_terminal_node_for_agent(
+        self,
+        agent_name: str,
+        channel_id: int,
+    ) -> Optional[tuple[JobGraph, JobNode, str]]:
+        """
+        Search ALL graphs (including completed/failed) for terminal nodes matching an agent.
+
+        Used to diagnose late agent responses: was this a timed-out node the agent
+        finally responded to, or a completely unsolicited message?
+
+        Returns:
+            Tuple of (graph, node, reason) if found, None otherwise.
+            reason is one of: "timed_out", "completed", "failed", "cancelled"
+        """
+        for graphs in self._graphs.values():
+            for graph in graphs:
+                if graph.channel_id != channel_id:
+                    continue
+                for node in graph.nodes.values():
+                    if node.type != NodeType.DISPATCH or node.agent != agent_name:
+                        continue
+                    if node.status == NodeStatus.FAILED:
+                        reason = "timed_out" if "Timed out" in (node.result or "") else "failed"
+                        return (graph, node, reason)
+                    if node.status == NodeStatus.COMPLETED:
+                        return (graph, node, "completed")
+                    if node.status == NodeStatus.CANCELLED:
+                        return (graph, node, "cancelled")
+        return None
+
     def get_channel_graphs_context(self, channel_id: int) -> str:
         """
         Get context string for active graphs in a specific channel.

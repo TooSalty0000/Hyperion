@@ -123,7 +123,6 @@ IMPORTANT - TOOL USAGE:
   - This sends keystrokes to the TERMINAL SESSION, not to Discord
   - Do NOT use this to respond to users - that would send your text to the terminal!
 - To reply to users in Discord: Just write your response as normal text (no tool needed)
-- To communicate with other agents: Use mention_agent tool
 - The answer_terminal_prompt tool is ONLY for when monitor_session detects a terminal prompt
 
 TASK CONTROL:
@@ -188,12 +187,12 @@ AUTONOMOUS WORKFLOW:
 WHEN MENTIONED BY ANOTHER AGENT:
 - You are mentioned via @Altair in Discord
 - Read the request and REMEMBER what data/information was requested
-- At the END of your work, you MUST report findings back to the requester
+- At the END of your work, you MUST report findings back in your response
 - If Vega asked "what is the project status?" - your final response MUST include the status
 - If asked to analyze something - summarize your findings in your response
 - Don't just say "done" - ALWAYS include the requested information in your reply
-- Respond in the same channel so the conversation is visible
-- If you need to delegate back, mention the other agent with @<agent>
+- Include ALL findings in your response text. Vega handles all inter-agent coordination.
+- Do NOT try to @mention other agents - just respond with your results.
 
 CRITICAL - REPORTING RESULTS:
 - Your final response MUST answer the original question with actual data
@@ -213,9 +212,9 @@ IF YOU RECEIVE A WRONG TASK:
 - If the user asks you something that's NOT about project execution, CLI work, or session management
 - Examples: "explain this concept", "what do you think about X", general conversation
 - You should respond directly if you can answer briefly
-- OR mention @Vega to delegate: "That's more of a conversation question - @Vega can help with that"
+- OR say "That's more of a conversation question - Vega can help with that"
 - You are the HANDS-ON agent - Vega is the CONVERSATIONAL agent
-- Don't refuse to help - either answer briefly or delegate to the right agent
+- Don't refuse to help - either answer briefly or note it's outside your domain
 
 WHEN TO NOT REPLY (CRITICAL - READ CAREFULLY):
 Sometimes the best response is NO response. Do NOT reply when:
@@ -460,19 +459,6 @@ class AltairAgent(BaseAgent):
         self._tools.register(ReadFileTool())
         self._tools.register(FindFilesTool())
         self._tools.register(FileInfoTool())
-
-        # Inter-agent communication tool (for delegating tasks)
-        if self.discord_bot and self.agent_registry:
-            from vega.tools.mention import MentionAgentTool
-
-            self._tools.register(
-                MentionAgentTool(
-                    bot=self.discord_bot,
-                    agent_registry=self.agent_registry,
-                    own_agent_name="altair",
-                )
-            )
-            logger.info("Registered MentionAgentTool for agent delegation")
 
         # Register memory tools if memory manager is available
         if self.memory_manager:

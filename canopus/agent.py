@@ -144,9 +144,10 @@ CRITICAL - AVOID DUPLICATE/REPETITIVE CONTENT:
 WHEN MENTIONED BY ANOTHER AGENT:
 - Vega may ask you to research topics on the web
 - Altair may ask you to verify deployed applications
-- Complete the task and report findings in the same channel
+- Complete the task and report findings in your response
 - Include screenshots as evidence when relevant
-- If you need to delegate, mention the appropriate agent
+- Include ALL findings in your response text. Vega handles all inter-agent coordination.
+- Do NOT try to @mention other agents - just respond with your results.
 
 HANDOFF PROTOCOL (IMPORTANT):
 After completing a search or research task, consider if another agent should act on findings:
@@ -466,19 +467,6 @@ class CanopusAgent(BaseAgent):
         self._tools.register(EmulateDeviceTool())
         self._tools.register(SetGeolocationTool())
         self._tools.register(SetTimezoneTool())
-
-        # Inter-agent communication
-        if self.discord_bot and self.agent_registry:
-            from vega.tools.mention import MentionAgentTool
-
-            self._tools.register(
-                MentionAgentTool(
-                    bot=self.discord_bot,
-                    agent_registry=self.agent_registry,
-                    own_agent_name="canopus",
-                )
-            )
-            logger.info("Registered MentionAgentTool for agent delegation")
 
         # Register soul tools if soul manager is available
         if self.soul_manager:

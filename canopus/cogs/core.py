@@ -262,9 +262,19 @@ class CanopusCore(commands.Cog, AgentAcknowledgmentMixin):
             return
 
         # Pre-enqueue check: Should we respond at all?
-        # Skip for agent dispatches (always respond to tasks)
-        # Check for casual mentions that don't need a response
-        if not is_from_agent:
+        if is_from_agent:
+            # Check if this is a genuine task dispatch (mention at start)
+            # vs. casual mention in another agent's conversational response.
+            # Real dispatches from the job graph executor always start with
+            # our @mention. Conversational messages embed mentions mid-text.
+            if not self._is_agent_dispatch(message):
+                logger.info(
+                    f"[Canopus] SKIPPING casual agent mention: '{clean_content[:50]}...' - "
+                    f"not a direct dispatch (mention not at start of message)"
+                )
+                return
+        else:
+            # Check for casual mentions from users that don't need a response
             should_respond = await self._should_respond_to_mention(message, clean_content)
             if not should_respond:
                 logger.info(
@@ -474,6 +484,33 @@ class CanopusCore(commands.Cog, AgentAcknowledgmentMixin):
             logger.warning(f"[Canopus] Freshness check failed: {e}")
             # On error, default to sending the response
             return True
+
+    def _is_agent_dispatch(self, message: discord.Message) -> bool:
+        """
+        Check if an agent message is a direct task dispatch vs. casual mention.
+
+        Real dispatches from the job graph executor start with the agent's
+        @mention followed by a task description:
+            "<@123456789> investigate the terminal issue"
+
+        Conversational messages (e.g., Vega's respond_to_user) embed mentions
+        within natural language:
+            "See? <@123456789> is already getting the hang of the bouncer role"
+
+        Returns True only for direct dispatches.
+        """
+        if not self.bot.user:
+            return True  # Can't check, assume dispatch to be safe
+
+        content = message.content.strip()
+        bot_id = str(self.bot.user.id)
+
+        # Dispatch format: message starts with our @mention
+        # Covers both <@ID> and <@!ID> (nickname) mention formats
+        if content.startswith(f"<@{bot_id}>") or content.startswith(f"<@!{bot_id}>"):
+            return True
+
+        return False
 
     async def _should_respond_to_mention(
         self,

@@ -165,7 +165,8 @@ class AgentMessageQueue:
 
         # Content-based deduplication for multi-agent requests
         self._recent_tasks: Dict[str, RecentTask] = {}  # hash -> RecentTask
-        self._task_ttl_seconds: int = 60  # How long to remember tasks
+        self._task_ttl_seconds: int = 600  # 10 min - must exceed typical queue backlog
+        self._max_queue_age_seconds: int = 300  # 5 min - drop stale messages
 
         # Optional callback for task state changes
         self._on_task_change: Optional[Callable[[Optional[TaskState]], Awaitable[None]]] = None
@@ -494,6 +495,17 @@ Reply with ONLY one word:
 
                 # Calculate queue wait time
                 queue_wait_ms = (datetime.now() - item.queued_at).total_seconds() * 1000
+
+                # Drop stale messages that sat in queue too long
+                if queue_wait_ms / 1000 > self._max_queue_age_seconds:
+                    logger.warning(
+                        f"[{self.agent_name}] DROPPING STALE: msg_id={item.message_id}, "
+                        f"waited={queue_wait_ms/1000:.0f}s, "
+                        f"content={item.context.message_content[:50]}..."
+                    )
+                    item.status = QueueItemStatus.CANCELLED
+                    self._queue.task_done()
+                    continue
 
                 self._is_processing = True
                 self._current_item = item

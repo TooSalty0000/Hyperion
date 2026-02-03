@@ -291,9 +291,27 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
         # ---- AGENT MESSAGE: route to graph node ----
         if is_from_agent and agent_name:
             handled = await self._handle_agent_response(message, agent_name)
-            if handled:
-                return
-            # Not handled by graph - fall through to process as new conversation
+            if not handled:
+                # Check if this was a late response to a terminal node
+                diag = ""
+                if self.executor:
+                    terminal = self.executor.find_terminal_node_for_agent(agent_name, message.channel.id)
+                    if terminal:
+                        _, node, reason = terminal
+                        diag = f" (late response to {reason} node '{node.id}')"
+                    else:
+                        diag = " (no matching node found in any graph - unsolicited)"
+                logger.warning(
+                    f"[Vega] DROPPING unmatched agent message from '{agent_name}' "
+                    f"in ch {message.channel.id}{diag}: '{content[:80]}'"
+                )
+            return  # Always return - agent messages NEVER become new conversations
+
+        # ---- CHANNEL FILTER ----
+        # Vega only processes new messages in the main channel.
+        # Agent dispatch responses are already handled above via the graph system.
+        if Config.AGENT_CHANNEL_ID and message.channel.id != Config.AGENT_CHANNEL_ID:
+            return
 
         # ---- USER/AGENT MESSAGE: trigger Vega processing ----
         if content and self._agent_initialized:
@@ -341,8 +359,8 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
 
         if not match:
             logger.debug(
-                f"[Vega] Agent '{agent_name}' responded but no matching node found. "
-                f"Will process as new conversation."
+                f"[Vega] Agent '{agent_name}' responded in ch {channel_id} "
+                f"but no RUNNING node found."
             )
             return False
 
