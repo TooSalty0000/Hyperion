@@ -158,6 +158,12 @@ screenshots/*.png
 screenshots/*.jpg
 !screenshots/.gitkeep
 
+# AI-generated images
+images/
+
+# hyperion-app is a separate repository
+hyperion-app/
+
 # Any local notes or scratch files
 NOTES.md
 TODO.local.md
