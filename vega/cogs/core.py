@@ -278,6 +278,16 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
         if content.startswith('!'):
             return
 
+        # Ignore user messages that @mention other agents (but not Vega)
+        if is_from_user and not is_mentioned and self._agent_registry:
+            mentions_other_agent = any(
+                f"<@{uid}>" in message.content or f"<@!{uid}>" in message.content
+                for name, uid in self._agent_registry.items()
+                if name != "vega"
+            )
+            if mentions_other_agent:
+                return
+
         # ---- AGENT MESSAGE: route to graph node ----
         if is_from_agent and agent_name:
             handled = await self._handle_agent_response(message, agent_name)
@@ -298,11 +308,12 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
             return  # Always return - agent messages NEVER become new conversations
 
         # ---- CHANNEL FILTER ----
-        # Vega only processes new messages in the main channel or active project channels.
-        # Agent dispatch responses are already handled above via the graph system.
+        # Vega only processes new messages in the main channel, active project channels,
+        # or department channels.
         if Config.AGENT_CHANNEL_ID and message.channel.id != Config.AGENT_CHANNEL_ID:
-            # Check if this is an active project channel (meeting room)
-            if not (self.executor and self.executor.get_graph_by_project_channel(message.channel.id)):
+            has_active = self.executor and self.executor.get_graph_by_project_channel(message.channel.id)
+            is_dept = self.executor and self.executor.is_department_channel(message.channel.id)
+            if not has_active and not is_dept:
                 return
 
         # ---- USER/AGENT MESSAGE: trigger Vega processing ----
@@ -456,6 +467,64 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
             is_from_agent=True,
         )
         return True
+
+    # --------------------------------------------------
+    # STARTUP RECOVERY
+    # --------------------------------------------------
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        """Recover department channels from Redis on startup."""
+        await self._load_department_channels()
+
+    async def _load_department_channels(self):
+        """Load department channels from project manager and register with executor."""
+        if not self.project_manager or not self.executor:
+            return
+
+        try:
+            projects = await self.project_manager.list_all()
+            recovered = 0
+            cleaned = 0
+
+            for project in projects:
+                if not project.channel_id:
+                    continue
+
+                # Verify the channel still exists in Discord
+                channel = self.bot.get_channel(project.channel_id)
+                if channel:
+                    self.executor.register_department(project.channel_id, project.name)
+                    recovered += 1
+                    logger.info(
+                        f"[Vega] Recovered department: {project.name} -> "
+                        f"channel {project.channel_id}"
+                    )
+                else:
+                    # Channel no longer exists, clean up
+                    try:
+                        await self.project_manager.update(
+                            project.name, channel_id=None
+                        )
+                        cleaned += 1
+                        logger.info(
+                            f"[Vega] Cleaned stale department: {project.name} "
+                            f"(channel {project.channel_id} gone)"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"[Vega] Failed to clean stale department "
+                            f"{project.name}: {e}"
+                        )
+
+            if recovered or cleaned:
+                logger.info(
+                    f"[Vega] Department recovery: {recovered} recovered, "
+                    f"{cleaned} cleaned"
+                )
+
+        except Exception as e:
+            logger.error(f"[Vega] Failed to load department channels: {e}")
 
     # --------------------------------------------------
     # REACTION HANDLER
