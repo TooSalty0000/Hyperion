@@ -70,9 +70,18 @@ class CreatePlanTool(Tool):
                 required=True,
                 items=NODE_ITEM_SCHEMA,
             ),
+            ToolParameter(
+                name="project",
+                type="string",
+                description=(
+                    "Optional project name. If the project has a department channel, "
+                    "the plan will use it automatically instead of creating a meeting room."
+                ),
+                required=False,
+            ),
         ]
 
-    async def execute(self, context: ToolContext, goal: str, nodes: list) -> str:
+    async def execute(self, context: ToolContext, goal: str, nodes: list, project: str = None) -> str:
         """Create a plan and register it with the executor."""
         executor = context.job_executor
         if not executor:
@@ -94,6 +103,38 @@ class CreatePlanTool(Tool):
 
         # Create the graph (and thread)
         graph = await executor.create_graph(goal, trigger_message)
+
+        # Set project name if provided
+        if project:
+            graph.project_name = project
+
+        # Check if project has an existing department channel
+        department_assigned = False
+        if project and context.project_manager:
+            try:
+                proj = await context.project_manager.get(project)
+                if proj and proj.channel_id:
+                    # Verify department is registered and channel exists
+                    if executor.is_department_channel(proj.channel_id):
+                        executor.assign_graph_to_department(graph, proj.channel_id)
+                        department_assigned = True
+
+                        # Post "new plan" notice in department
+                        dept_channel = executor.bot.get_channel(proj.channel_id)
+                        if dept_channel:
+                            try:
+                                embed = discord.Embed(
+                                    title=f"New Plan: {goal[:80]}",
+                                    description=(
+                                        f"Graph `{graph.id}` started in this department."
+                                    ),
+                                    color=0x5865F2,
+                                )
+                                await dept_channel.send(embed=embed)
+                            except discord.HTTPException:
+                                pass
+            except Exception as e:
+                logger.warning(f"Failed to check project department: {e}")
 
         # Add nodes
         errors = []
@@ -130,11 +171,11 @@ class CreatePlanTool(Tool):
             error_str = "; ".join(errors)
             return f"Plan created with {len(graph.nodes)} nodes. Errors: {error_str}"
 
-        # Create meeting room if any DISPATCH nodes exist
+        # Create meeting room if any DISPATCH nodes exist (skip if department already assigned)
         has_dispatch = any(
             n.type == NodeType.DISPATCH for n in graph.nodes.values()
         )
-        if has_dispatch:
+        if has_dispatch and not department_assigned:
             project_channel_id = await executor.create_project_channel(graph)
             if project_channel_id and trigger_message:
                 try:

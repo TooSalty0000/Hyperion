@@ -35,6 +35,7 @@ class Project:
     name: str
     path: str
     settings: Optional[Dict[str, Any]] = None
+    channel_id: Optional[int] = None  # Persistent department channel ID
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
 

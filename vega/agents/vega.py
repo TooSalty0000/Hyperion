@@ -98,8 +98,25 @@ When the user cancels a task (agent reports "stopped", "cancelled", "permission 
    - Or acknowledge the cancellation with `respond_to_user`
 3. Never leave the user hanging after a cancellation - always take action.
 
-MEETING ROOMS:
-When you create a plan with dispatch nodes, the system automatically creates a dedicated "meeting room" channel for that plan. Agent dispatches and responses happen in the meeting room, keeping the user's main channel clean. When you call `respond_to_user`, the final answer is always delivered to the main channel, not the meeting room. The meeting room is automatically deleted when the plan completes or fails. You do not need to manage meeting rooms - they are handled automatically.
+MEETING ROOMS & DEPARTMENTS:
+When you create a plan with dispatch nodes, the system creates a temporary "meeting room" channel.
+Meeting rooms are deleted when the plan completes.
+
+For long-term or recurring projects, use `propose_department` to convert a meeting room into
+a persistent "department" channel. This sends an approval request with buttons to the user.
+If approved, the channel persists and is reused for future work on the same project.
+
+WHEN TO PROPOSE A DEPARTMENT:
+- The project will need multiple rounds of work over time
+- The user explicitly asks for a persistent workspace
+- You've done 2+ plans for the same project topic
+Do NOT propose departments for one-off tasks.
+
+USING EXISTING DEPARTMENTS:
+Pass the `project` parameter in create_plan to auto-route to an existing department.
+
+CLOSING DEPARTMENTS:
+Use close_department to propose closing an inactive department.
 
 MENTIONING USERS & AGENTS:
 When addressing someone by name, use `@Name` format (e.g., `@Sirius`, `@Altair`). This creates a proper Discord mention.
@@ -156,8 +173,9 @@ class VegaAgent(BaseAgent):
         self.agent_registry = agent_registry
 
     def _register_tools(self):
-        """Register Vega's tools - graph orchestration + memory + soul."""
+        """Register Vega's tools - graph orchestration + department + memory + soul."""
         from vega.tools.graph import get_graph_tools
+        from vega.tools.department import get_department_tools
         from shared.memory.tools import get_memory_tools
         from shared.soul.tools import get_soul_tools
 
@@ -165,6 +183,11 @@ class VegaAgent(BaseAgent):
         for tool in get_graph_tools():
             self._tools.register(tool)
         logger.info("Registered graph orchestration tools")
+
+        # Register department tools (propose_department, close_department)
+        for tool in get_department_tools():
+            self._tools.register(tool)
+        logger.info("Registered department tools")
 
         # Register memory tools if memory manager is available
         if self.memory_manager:
@@ -187,6 +210,7 @@ class VegaAgent(BaseAgent):
         memory_context: Optional[str] = None,
         graph_context: Optional[str] = None,
         soul_context: Optional[str] = None,
+        department_context: Optional[str] = None,
     ) -> str:
         """
         Build Vega's system prompt with graph state, soul, and memory context.
@@ -195,6 +219,7 @@ class VegaAgent(BaseAgent):
             memory_context: Pre-built memory context string to include
             graph_context: Active job graph state from executor
             soul_context: Pre-built soul context string (injected before memory)
+            department_context: Active department channels info
         """
         tools_desc = self.get_tools_description()
 
@@ -213,6 +238,11 @@ AVAILABLE TOOLS:
             base_prompt += f"""
 
 ## {graph_context}"""
+
+        if department_context:
+            base_prompt += f"""
+
+## {department_context}"""
 
         # Soul context comes BEFORE memory (who you are > what you know)
         if soul_context:
@@ -278,11 +308,26 @@ When you need to recall past information, check your active context above or use
             # Build graph context (active plans Vega needs to be aware of)
             # Use channel-specific context to help Vega decide extend vs create new
             graph_context_str = None
+            department_context_str = None
             if job_executor:
                 graph_context_str = job_executor.get_channel_graphs_context(context.channel_id)
 
+                # Build department context
+                dept_info = job_executor.get_department_info()
+                if dept_info:
+                    dept_lines = ["DEPARTMENTS (persistent channels):"]
+                    for ch_id, proj_name in dept_info.items():
+                        dept_lines.append(f"- <#{ch_id}> - Project: {proj_name}")
+                    dept_lines.append(
+                        "Use `project` parameter in create_plan to route work to a department."
+                    )
+                    department_context_str = "\n".join(dept_lines)
+
             # Build conversation history
-            messages = await self._build_messages(context, memory_context_str, graph_context_str, soul_context_str)
+            messages = await self._build_messages(
+                context, memory_context_str, graph_context_str,
+                soul_context_str, department_context_str,
+            )
 
             # Get tool definitions
             tool_defs = self.tools.get_definitions()
@@ -426,10 +471,13 @@ When you need to recall past information, check your active context above or use
         memory_context: Optional[str] = None,
         graph_context: Optional[str] = None,
         soul_context: Optional[str] = None,
+        department_context: Optional[str] = None,
     ) -> List[Message]:
         """Build message history for LLM."""
-        # Use memory-enhanced system prompt with graph state and soul
-        system_prompt = self.get_system_prompt(memory_context, graph_context, soul_context)
+        # Use memory-enhanced system prompt with graph state, soul, and departments
+        system_prompt = self.get_system_prompt(
+            memory_context, graph_context, soul_context, department_context,
+        )
         messages = [Message(role=Role.SYSTEM, content=system_prompt)]
 
         # Fetch recent Discord channel history for conversation context

@@ -54,8 +54,12 @@ class JobGraphExecutor:
         # Thread ID → graph mapping for quick lookup
         self._thread_to_graph: dict[int, JobGraph] = {}
 
-        # Project channel (meeting room) → graph mapping
-        self._project_channel_to_graph: dict[int, JobGraph] = {}
+        # Project channel (meeting room / department) → list of graphs (1:many for departments)
+        self._project_channel_to_graphs: dict[int, list[JobGraph]] = {}
+
+        # Department channel tracking (persistent channels that survive graph completion)
+        self._department_channel_ids: set[int] = set()
+        self._department_info: dict[int, str] = {}  # channel_id -> project_name
 
         # Per-node timeout tasks: "graph_id:node_id" → asyncio.Task
         self._timeout_tasks: dict[str, asyncio.Task] = {}
@@ -315,12 +319,12 @@ class JobGraphExecutor:
         """
         candidates = []
 
-        # Check project channel index first (meeting room responses)
-        project_graph = self._project_channel_to_graph.get(channel_id)
-        if project_graph and project_graph.status == GraphStatus.ACTIVE:
-            for node in project_graph.get_running_nodes():
-                if node.type == NodeType.DISPATCH and node.agent == agent_name:
-                    candidates.append((project_graph, node))
+        # Check project channel index first (meeting room / department responses)
+        for project_graph in self._project_channel_to_graphs.get(channel_id, []):
+            if project_graph.status == GraphStatus.ACTIVE:
+                for node in project_graph.get_running_nodes():
+                    if node.type == NodeType.DISPATCH and node.agent == agent_name:
+                        candidates.append((project_graph, node))
 
         # Then check main channel index (no meeting room / backward compat)
         if not candidates:
@@ -408,7 +412,7 @@ class JobGraphExecutor:
         return "\n".join(lines)
 
     async def complete_graph(self, graph: JobGraph) -> None:
-        """Mark a graph as completed and delete the planning thread and meeting room."""
+        """Mark a graph as completed. Delete thread and meeting room (but not departments)."""
         graph.status = GraphStatus.COMPLETED
 
         # Cancel any remaining timeout tasks for this graph
@@ -417,14 +421,20 @@ class JobGraphExecutor:
         # Post completion embed then delete the thread
         await self._post_completion_embed(graph, success=True)
         await self._delete_thread(graph)
-        await self._delete_project_channel(graph)
+
+        # Only delete channel if it's NOT a department
+        if graph.project_channel_id and graph.project_channel_id not in self._department_channel_ids:
+            await self._delete_project_channel(graph)
+        elif graph.project_channel_id and graph.project_channel_id in self._department_channel_ids:
+            # Remove graph from the channel's graph list but keep the channel
+            self._remove_graph_from_channel(graph)
 
         # Clean up thread mapping
         if graph.thread_id and graph.thread_id in self._thread_to_graph:
             del self._thread_to_graph[graph.thread_id]
 
     async def fail_graph(self, graph: JobGraph) -> None:
-        """Mark a graph as failed and delete the planning thread and meeting room."""
+        """Mark a graph as failed. Delete thread and meeting room (but not departments)."""
         graph.status = GraphStatus.FAILED
 
         # Cancel any remaining timeout tasks for this graph
@@ -433,11 +443,25 @@ class JobGraphExecutor:
         # Post failure embed then delete the thread
         await self._post_completion_embed(graph, success=False)
         await self._delete_thread(graph)
-        await self._delete_project_channel(graph)
+
+        # Only delete channel if it's NOT a department
+        if graph.project_channel_id and graph.project_channel_id not in self._department_channel_ids:
+            await self._delete_project_channel(graph)
+        elif graph.project_channel_id and graph.project_channel_id in self._department_channel_ids:
+            self._remove_graph_from_channel(graph)
 
         # Clean up thread mapping
         if graph.thread_id and graph.thread_id in self._thread_to_graph:
             del self._thread_to_graph[graph.thread_id]
+
+    def _remove_graph_from_channel(self, graph: JobGraph) -> None:
+        """Remove a graph from a project channel's graph list."""
+        if not graph.project_channel_id:
+            return
+        graphs = self._project_channel_to_graphs.get(graph.project_channel_id, [])
+        self._project_channel_to_graphs[graph.project_channel_id] = [
+            g for g in graphs if g.id != graph.id
+        ]
 
     # --------------------------------------------------
     # PROJECT CHANNELS (Meeting Rooms)
@@ -470,7 +494,9 @@ class JobGraphExecutor:
         )
         if channel:
             graph.project_channel_id = channel.id
-            self._project_channel_to_graph[channel.id] = graph
+            if channel.id not in self._project_channel_to_graphs:
+                self._project_channel_to_graphs[channel.id] = []
+            self._project_channel_to_graphs[channel.id].append(graph)
             logger.info(
                 f"[Executor] Created meeting room {channel.id} for graph {graph.id}"
             )
@@ -494,19 +520,65 @@ class JobGraphExecutor:
         return None
 
     def get_graph_by_project_channel(self, channel_id: int) -> Optional[JobGraph]:
-        """Get the active graph that owns a project channel."""
-        graph = self._project_channel_to_graph.get(channel_id)
-        if graph and graph.status == GraphStatus.ACTIVE:
-            return graph
+        """Get the first active graph in a project channel (backward compat)."""
+        for graph in self._project_channel_to_graphs.get(channel_id, []):
+            if graph.status == GraphStatus.ACTIVE:
+                return graph
         return None
 
+    def get_graphs_by_project_channel(self, channel_id: int) -> list[JobGraph]:
+        """Get all active graphs in a project channel."""
+        return [
+            g for g in self._project_channel_to_graphs.get(channel_id, [])
+            if g.status == GraphStatus.ACTIVE
+        ]
+
     def get_active_project_channel_ids(self) -> set[int]:
-        """Get all channel IDs of active meeting rooms."""
-        return {
+        """Get all channel IDs of active meeting rooms and departments."""
+        active = {
             ch_id
-            for ch_id, graph in self._project_channel_to_graph.items()
-            if graph.status == GraphStatus.ACTIVE
+            for ch_id, graphs in self._project_channel_to_graphs.items()
+            if any(g.status == GraphStatus.ACTIVE for g in graphs)
         }
+        return active | self._department_channel_ids
+
+    # --------------------------------------------------
+    # DEPARTMENT MANAGEMENT
+    # --------------------------------------------------
+
+    def assign_graph_to_department(self, graph: JobGraph, channel_id: int) -> None:
+        """Assign a graph to an existing department channel."""
+        graph.project_channel_id = channel_id
+        if channel_id not in self._project_channel_to_graphs:
+            self._project_channel_to_graphs[channel_id] = []
+        self._project_channel_to_graphs[channel_id].append(graph)
+        logger.info(
+            f"[Executor] Assigned graph {graph.id} to department channel {channel_id}"
+        )
+
+    def register_department(self, channel_id: int, project_name: str) -> None:
+        """Register a channel as a persistent department."""
+        self._department_channel_ids.add(channel_id)
+        self._department_info[channel_id] = project_name
+        if channel_id not in self._project_channel_to_graphs:
+            self._project_channel_to_graphs[channel_id] = []
+        logger.info(
+            f"[Executor] Registered department: channel={channel_id}, project={project_name}"
+        )
+
+    def unregister_department(self, channel_id: int) -> None:
+        """Unregister a department channel."""
+        self._department_channel_ids.discard(channel_id)
+        self._department_info.pop(channel_id, None)
+        logger.info(f"[Executor] Unregistered department: channel={channel_id}")
+
+    def is_department_channel(self, channel_id: int) -> bool:
+        """Check if a channel is a registered department."""
+        return channel_id in self._department_channel_ids
+
+    def get_department_info(self) -> dict[int, str]:
+        """Get mapping of department channel IDs to project names."""
+        return dict(self._department_info)
 
     # --------------------------------------------------
     # EMBED HELPERS
@@ -690,9 +762,14 @@ class JobGraphExecutor:
         if self.channel_manager:
             await self.channel_manager.delete_project_channel(graph.project_channel_id)
 
-        # Clean up index
-        if graph.project_channel_id in self._project_channel_to_graph:
-            del self._project_channel_to_graph[graph.project_channel_id]
+        # Clean up index - remove this graph and delete key if list is empty
+        if graph.project_channel_id in self._project_channel_to_graphs:
+            graphs = self._project_channel_to_graphs[graph.project_channel_id]
+            self._project_channel_to_graphs[graph.project_channel_id] = [
+                g for g in graphs if g.id != graph.id
+            ]
+            if not self._project_channel_to_graphs[graph.project_channel_id]:
+                del self._project_channel_to_graphs[graph.project_channel_id]
 
     async def post_to_thread(self, graph: JobGraph, message: str) -> None:
         """Post a plain text message to a graph's planning thread (legacy compat)."""
@@ -729,8 +806,16 @@ class JobGraphExecutor:
                 if graph.status != GraphStatus.ACTIVE and graph.created_at < cutoff:
                     if graph.thread_id and graph.thread_id in self._thread_to_graph:
                         del self._thread_to_graph[graph.thread_id]
-                    if graph.project_channel_id and graph.project_channel_id in self._project_channel_to_graph:
-                        del self._project_channel_to_graph[graph.project_channel_id]
+                    # Clean up project channel mapping (but not department keys)
+                    if graph.project_channel_id and graph.project_channel_id in self._project_channel_to_graphs:
+                        pc_graphs = self._project_channel_to_graphs[graph.project_channel_id]
+                        self._project_channel_to_graphs[graph.project_channel_id] = [
+                            g for g in pc_graphs if g.id != graph.id
+                        ]
+                        # Only remove the key if empty AND not a department
+                        if (not self._project_channel_to_graphs[graph.project_channel_id]
+                                and graph.project_channel_id not in self._department_channel_ids):
+                            del self._project_channel_to_graphs[graph.project_channel_id]
                     cleaned += 1
                 else:
                     remaining.append(graph)

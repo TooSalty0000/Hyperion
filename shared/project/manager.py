@@ -62,13 +62,16 @@ class ProjectManager:
 
     def _serialize(self, project: Project) -> str:
         """Serialize project to JSON."""
-        return json.dumps({
+        data = {
             "name": project.name,
             "path": project.path,
             "settings": project.settings,
             "created_at": project.created_at.isoformat(),
-            "updated_at": project.updated_at.isoformat()
-        })
+            "updated_at": project.updated_at.isoformat(),
+        }
+        if project.channel_id is not None:
+            data["channel_id"] = project.channel_id
+        return json.dumps(data)
 
     def _deserialize(self, data: str) -> Project:
         """Deserialize project from JSON."""
@@ -77,8 +80,9 @@ class ProjectManager:
             name=d["name"],
             path=d["path"],
             settings=d.get("settings"),
+            channel_id=d.get("channel_id"),
             created_at=datetime.fromisoformat(d["created_at"]),
-            updated_at=datetime.fromisoformat(d["updated_at"])
+            updated_at=datetime.fromisoformat(d["updated_at"]),
         )
 
     async def create(
@@ -183,6 +187,14 @@ class ProjectManager:
                 projects.append(project)
 
         return projects
+
+    async def get_by_channel_id(self, channel_id: int) -> Optional[Project]:
+        """Get project by its department channel ID (linear scan)."""
+        projects = await self.list_all()
+        for project in projects:
+            if project.channel_id == channel_id:
+                return project
+        return None
 
     async def exists(self, name: str) -> bool:
         """Check if project exists."""
