@@ -19,3 +19,12 @@ playwright
 
 # HTTP client for ngrok API
 httpx
+
+# Polaris API server
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+PyJWT>=2.8.0
+pwdlib[bcrypt]>=0.2.0
+pywebpush>=2.0.0
+py-vapid>=1.9.0
+websockets>=12.0

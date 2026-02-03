@@ -1,4 +1,4 @@
-.PHONY: help install start start-vega start-altair start-all start-verbose clean test-imports test
+.PHONY: help install start start-vega start-altair start-all start-verbose start-api clean test-imports test
 
 PYTHON = python3
 PIP = pip3
@@ -11,6 +11,7 @@ help:
 	@echo "make start-vega    - Run Vega bot only"
 	@echo "make start-altair  - Run Altair bot only"
 	@echo "make start-all     - Run all bots (Vega + Altair + Polaris + Canopus)"
+	@echo "make start-api     - Run Polaris API server"
 	@echo "make start-verbose - Run all bots with timing details"
 	@echo "make test          - Run pytest test suite"
 	@echo "make test-imports  - Test all module imports"
@@ -29,6 +30,9 @@ start-altair:
 
 start-all:
 	$(PYTHON) run_all.py
+
+start-api:
+	$(PYTHON) -m polaris.api.main
 
 start-verbose:
 	$(PYTHON) run_all.py --verbose

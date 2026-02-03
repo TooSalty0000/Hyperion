@@ -10,6 +10,7 @@ Usage:
     python run_all.py --altair   # Start only Altair
     python run_all.py --polaris  # Start only Polaris
     python run_all.py --canopus  # Start only Canopus
+    python run_all.py --api      # Also start Polaris API server
     python run_all.py --vega --polaris  # Start Vega and Polaris
     python run_all.py --verbose  # Enable verbose timing logs
 """
@@ -224,6 +225,7 @@ async def main(
     run_altair: bool = True,
     run_polaris: bool = True,
     run_canopus: bool = True,
+    run_api: bool = False,
 ):
     """Main entry point."""
     manager = BotManager()
@@ -327,11 +329,41 @@ async def main(
         except Exception as e:
             logger.error(f"Failed to initialize Canopus: {e}")
 
-    if not manager.bots:
+    if not manager.bots and not run_api:
         logger.error("No bots could be initialized. Check your .env configuration.")
         return
 
+    # Optionally start Polaris API server alongside bots
+    api_task = None
+    if run_api:
+        try:
+            import uvicorn
+            from polaris.api.config import get_api_config
+
+            api_config = get_api_config()
+            uv_config = uvicorn.Config(
+                "polaris.api.main:app",
+                host=api_config.host,
+                port=api_config.port,
+                log_level="info",
+            )
+            server = uvicorn.Server(uv_config)
+            api_task = asyncio.create_task(server.serve())
+            logger.info(f"Polaris API starting on {api_config.host}:{api_config.port}")
+        except ImportError:
+            logger.error("uvicorn not installed — cannot start API server")
+        except Exception as e:
+            logger.error(f"Failed to start API server: {e}")
+
     await manager.run_all()
+
+    # Clean up API task
+    if api_task and not api_task.done():
+        api_task.cancel()
+        try:
+            await api_task
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":
@@ -339,6 +371,8 @@ if __name__ == "__main__":
     has_specific_bot = any(
         arg in sys.argv for arg in ["--vega", "--altair", "--polaris", "--canopus"]
     )
+
+    run_api = "--api" in sys.argv
 
     if has_specific_bot:
         run_vega = "--vega" in sys.argv
@@ -361,6 +395,7 @@ if __name__ == "__main__":
             run_altair=run_altair,
             run_polaris=run_polaris,
             run_canopus=run_canopus,
+            run_api=run_api,
         ))
     except KeyboardInterrupt:
         logger.info("Interrupted")
