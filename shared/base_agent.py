@@ -41,6 +41,8 @@ class AgentResponse:
     # Error handling
     error: Optional[str] = None
     status: str = "complete"  # "complete", "error", "delegated"
+    # Response routing override (send final response to this channel instead of default)
+    response_channel_id: Optional[int] = None
 
 
 class BaseAgent(ABC):

@@ -52,6 +52,11 @@ class ToolContext:
     # Signals Vega's process loop to yield and wait for agent responses.
     dispatched_to_agents: bool = False
 
+    # Override channel for response delivery (set by RespondToUserTool).
+    # When set, the cog sends the final response to this channel
+    # instead of the channel the processing context came from.
+    response_channel_id: Optional[int] = None
+
     def with_session(self, session_id: int) -> 'ToolContext':
         """Create a new context with updated session ID."""
         return ToolContext(
@@ -71,6 +76,7 @@ class ToolContext:
             current_agent_id=self.current_agent_id,
             conversation_id=self.conversation_id,
             start_output_loop_callback=self.start_output_loop_callback,
+            response_channel_id=self.response_channel_id,
         )
 
 

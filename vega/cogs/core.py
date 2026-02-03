@@ -165,6 +165,11 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
                 agent_registry=self._agent_registry,
                 max_timeout=max_timeout,
             )
+
+            # Give executor access to channel manager for meeting room creation
+            from shared.channel.manager import ChannelManager
+            self.executor.channel_manager = ChannelManager(self.bot)
+
             logger.info(f"Job graph executor initialized (max_timeout={max_timeout}s)")
 
             # Create Vega agent
@@ -308,10 +313,12 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
             return  # Always return - agent messages NEVER become new conversations
 
         # ---- CHANNEL FILTER ----
-        # Vega only processes new messages in the main channel.
+        # Vega only processes new messages in the main channel or active project channels.
         # Agent dispatch responses are already handled above via the graph system.
         if Config.AGENT_CHANNEL_ID and message.channel.id != Config.AGENT_CHANNEL_ID:
-            return
+            # Check if this is an active project channel (meeting room)
+            if not (self.executor and self.executor.get_graph_by_project_channel(message.channel.id)):
+                return
 
         # ---- USER/AGENT MESSAGE: trigger Vega processing ----
         if content and self._agent_initialized:
@@ -379,10 +386,14 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
         )
         await self.executor._send_to_thread(graph, embed=embed)
 
+        # Use the graph's MAIN channel for re-evaluation context (not the meeting room).
+        # This ensures respond_to_user targets the main channel.
+        context_channel_id = graph.channel_id
+
         # Trigger Vega re-evaluation with the agent's actual response content
         # Include the response directly so Vega doesn't rely solely on Discord history
         conversation_id = await self._get_or_create_conversation(
-            channel_id=channel_id,
+            channel_id=context_channel_id,
             user_id=0,
         )
 
@@ -415,7 +426,7 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
             )
 
         context = AgentContext(
-            channel_id=channel_id,
+            channel_id=context_channel_id,
             user_id=0,  # System-triggered (agent response)
             message_content=(
                 f"[AGENT RESPONSE] {agent_name} responded to node '{node.id}' "
@@ -489,7 +500,12 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
 
                 # Send response if we have content
                 if response.content:
-                    target_channel = channel
+                    # Use response_channel_id override if set (e.g. respond_to_user
+                    # routes final answers to the main channel, not the meeting room)
+                    if response.response_channel_id:
+                        target_channel = self.bot.get_channel(response.response_channel_id)
+                    else:
+                        target_channel = channel
                     if not target_channel:
                         return
 

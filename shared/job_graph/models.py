@@ -102,6 +102,7 @@ class JobGraph:
     thread_id: Optional[int] = None       # Discord thread ID for planning visibility
     trigger_message_id: Optional[int] = None  # User's original message
     channel_id: Optional[int] = None      # Main channel where user sent the message
+    project_channel_id: Optional[int] = None  # Meeting room channel for agent dispatches
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     max_timeout: int = 600                # Overall max timeout per node (env: JOB_MAX_TIMEOUT)
 
@@ -239,6 +240,8 @@ class JobGraph:
         """
         lines = [f"ACTIVE JOB GRAPH (id={self.id}, status={self.status.value}):"]
         lines.append(f"Goal: {self.goal}")
+        if self.project_channel_id:
+            lines.append(f"Meeting Room: <#{self.project_channel_id}>")
         lines.append(f"Nodes:")
 
         for node in self.nodes.values():

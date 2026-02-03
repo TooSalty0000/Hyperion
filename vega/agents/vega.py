@@ -98,6 +98,9 @@ When the user cancels a task (agent reports "stopped", "cancelled", "permission 
    - Or acknowledge the cancellation with `respond_to_user`
 3. Never leave the user hanging after a cancellation - always take action.
 
+MEETING ROOMS:
+When you create a plan with dispatch nodes, the system automatically creates a dedicated "meeting room" channel for that plan. Agent dispatches and responses happen in the meeting room, keeping the user's main channel clean. When you call `respond_to_user`, the final answer is always delivered to the main channel, not the meeting room. The meeting room is automatically deleted when the plan completes or fails. You do not need to manage meeting rooms - they are handled automatically.
+
 MENTIONING USERS & AGENTS:
 When addressing someone by name, use `@Name` format (e.g., `@Sirius`, `@Altair`). This creates a proper Discord mention.
 - In `respond_to_user`: You MAY mention users or agents when it's natural to the conversation (e.g., "Hi @Sirius, nice to meet you!")
@@ -337,6 +340,7 @@ When you need to recall past information, check your active context above or use
                         agent_name=self.name,
                         tool_calls_made=tool_calls_made,
                         processing_time_ms=processing_time,
+                        response_channel_id=tool_context.response_channel_id,
                     )
 
                 # Execute tool calls
@@ -359,6 +363,7 @@ When you need to recall past information, check your active context above or use
                         agent_name=self.name,
                         tool_calls_made=tool_calls_made,
                         processing_time_ms=processing_time,
+                        response_channel_id=tool_context.response_channel_id,
                     )
 
                 # Check if work was dispatched to external agents - yield and wait
@@ -400,6 +405,7 @@ When you need to recall past information, check your active context above or use
                 processing_time_ms=processing_time,
                 status="error" if not tool_context.response_message else None,
                 error="Max iterations reached" if not tool_context.response_message else None,
+                response_channel_id=tool_context.response_channel_id,
             )
 
         except Exception as e:

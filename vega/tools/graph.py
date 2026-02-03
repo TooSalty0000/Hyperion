@@ -7,6 +7,8 @@ for orchestrating work across agents.
 import logging
 from typing import List, Optional
 
+import discord
+
 from shared.llm.types import ToolParameter
 from shared.tools.interface import Tool, ToolContext
 from shared.job_graph.models import JobNode, JobGraph, NodeType, NodeStatus
@@ -128,6 +130,21 @@ class CreatePlanTool(Tool):
             error_str = "; ".join(errors)
             return f"Plan created with {len(graph.nodes)} nodes. Errors: {error_str}"
 
+        # Create meeting room if any DISPATCH nodes exist
+        has_dispatch = any(
+            n.type == NodeType.DISPATCH for n in graph.nodes.values()
+        )
+        if has_dispatch:
+            project_channel_id = await executor.create_project_channel(graph)
+            if project_channel_id and trigger_message:
+                try:
+                    await trigger_message.channel.send(
+                        f"Created meeting room <#{project_channel_id}> for this plan.",
+                        silent=True,
+                    )
+                except discord.HTTPException:
+                    pass
+
         # Post the plan embed to the thread
         await executor._post_plan_embed(graph)
 
@@ -220,6 +237,16 @@ class AddNodesTool(Tool):
                 added += 1
             except (ValueError, KeyError) as e:
                 logger.warning(f"Failed to add node: {e}")
+
+        # Lazily create meeting room if first DISPATCH nodes were just added
+        if not graph.project_channel_id:
+            has_new_dispatch = any(
+                isinstance(nd, dict)
+                and NodeType(nd.get("type", "think")) == NodeType.DISPATCH
+                for nd in nodes
+            )
+            if has_new_dispatch:
+                await executor.create_project_channel(graph)
 
         # Dispatch newly ready nodes
         dispatched = await executor.dispatch_ready_nodes(graph)
@@ -436,6 +463,13 @@ class RespondToUserTool(Tool):
         if not executor:
             # Still deliver the response even without executor
             return f"Response queued (no executor). ({len(message)} chars)."
+
+        # Route response to the graph's main channel (not the meeting room)
+        if graph_id:
+            for g in executor.get_all_active_graphs():
+                if g.id == graph_id and g.channel_id:
+                    context.response_channel_id = g.channel_id
+                    break
 
         # Find the graph and complete it
         if graph_id:

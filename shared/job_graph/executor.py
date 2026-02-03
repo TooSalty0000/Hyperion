@@ -1,12 +1,16 @@
 """Job Graph Executor - manages active graphs and dispatches work."""
 
+import asyncio
 import logging
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import discord
 from discord.ext import commands
 
 from .models import JobGraph, JobNode, NodeType, NodeStatus, GraphStatus
+
+if TYPE_CHECKING:
+    from shared.channel.manager import ChannelManager
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +50,12 @@ class JobGraphExecutor:
 
         # Thread ID → graph mapping for quick lookup
         self._thread_to_graph: dict[int, JobGraph] = {}
+
+        # Project channel (meeting room) → graph mapping
+        self._project_channel_to_graph: dict[int, JobGraph] = {}
+
+        # Channel manager for creating/deleting meeting rooms (set by VegaCore)
+        self.channel_manager: Optional["ChannelManager"] = None
 
     def get_active_graphs(self, channel_id: int) -> list[JobGraph]:
         """Get all active graphs for a channel."""
@@ -148,9 +158,11 @@ class JobGraphExecutor:
             graph.mark_failed(node.id, f"Unknown agent: {node.agent}")
             return False
 
-        channel = self.bot.get_channel(graph.channel_id)
+        # Use meeting room if available, fall back to main channel
+        dispatch_channel_id = graph.project_channel_id or graph.channel_id
+        channel = self.bot.get_channel(dispatch_channel_id)
         if not channel:
-            logger.error(f"[Executor] Channel {graph.channel_id} not found")
+            logger.error(f"[Executor] Channel {dispatch_channel_id} not found")
             graph.mark_failed(node.id, "Channel not found")
             return False
 
@@ -200,14 +212,24 @@ class JobGraphExecutor:
         Find the running DISPATCH node that an agent response likely corresponds to.
 
         Matches by: agent name + channel + RUNNING status.
+        Checks project channels (meeting rooms) first, then main channel index.
         If multiple match, returns the oldest (first dispatched).
         """
         candidates = []
 
-        for graph in self.get_active_graphs(channel_id):
-            for node in graph.get_running_nodes():
+        # Check project channel index first (meeting room responses)
+        project_graph = self._project_channel_to_graph.get(channel_id)
+        if project_graph and project_graph.status == GraphStatus.ACTIVE:
+            for node in project_graph.get_running_nodes():
                 if node.type == NodeType.DISPATCH and node.agent == agent_name:
-                    candidates.append((graph, node))
+                    candidates.append((project_graph, node))
+
+        # Then check main channel index (no meeting room / backward compat)
+        if not candidates:
+            for graph in self.get_active_graphs(channel_id):
+                for node in graph.get_running_nodes():
+                    if node.type == NodeType.DISPATCH and node.agent == agent_name:
+                        candidates.append((graph, node))
 
         if not candidates:
             return None
@@ -233,7 +255,8 @@ class JobGraphExecutor:
         """
         for graphs in self._graphs.values():
             for graph in graphs:
-                if graph.channel_id != channel_id:
+                # Match on main channel OR project channel
+                if graph.channel_id != channel_id and graph.project_channel_id != channel_id:
                     continue
                 for node in graph.nodes.values():
                     if node.type != NodeType.DISPATCH or node.agent != agent_name:
@@ -287,28 +310,99 @@ class JobGraphExecutor:
         return "\n".join(lines)
 
     async def complete_graph(self, graph: JobGraph) -> None:
-        """Mark a graph as completed and delete the planning thread."""
+        """Mark a graph as completed and delete the planning thread and meeting room."""
         graph.status = GraphStatus.COMPLETED
 
         # Post completion embed then delete the thread
         await self._post_completion_embed(graph, success=True)
         await self._delete_thread(graph)
+        await self._delete_project_channel(graph)
 
         # Clean up thread mapping
         if graph.thread_id and graph.thread_id in self._thread_to_graph:
             del self._thread_to_graph[graph.thread_id]
 
     async def fail_graph(self, graph: JobGraph) -> None:
-        """Mark a graph as failed and delete the planning thread."""
+        """Mark a graph as failed and delete the planning thread and meeting room."""
         graph.status = GraphStatus.FAILED
 
         # Post failure embed then delete the thread
         await self._post_completion_embed(graph, success=False)
         await self._delete_thread(graph)
+        await self._delete_project_channel(graph)
 
         # Clean up thread mapping
         if graph.thread_id and graph.thread_id in self._thread_to_graph:
             del self._thread_to_graph[graph.thread_id]
+
+    # --------------------------------------------------
+    # PROJECT CHANNELS (Meeting Rooms)
+    # --------------------------------------------------
+
+    async def create_project_channel(self, graph: JobGraph) -> Optional[int]:
+        """
+        Create a meeting room channel for a graph.
+
+        Returns the channel ID, or None if creation failed (dispatches
+        will fall back to the main channel).
+        """
+        if graph.project_channel_id:
+            return graph.project_channel_id  # Already has one
+
+        if not self.channel_manager:
+            logger.warning("[Executor] No channel_manager, dispatching to main channel")
+            return None
+
+        # Need guild from the main channel
+        main_channel = self.bot.get_channel(graph.channel_id)
+        if not main_channel or not hasattr(main_channel, "guild"):
+            logger.warning("[Executor] Cannot resolve guild for project channel")
+            return None
+
+        channel = await self.channel_manager.create_project_channel(
+            guild=main_channel.guild,
+            graph_id=graph.id,
+            goal=graph.goal,
+        )
+        if channel:
+            graph.project_channel_id = channel.id
+            self._project_channel_to_graph[channel.id] = graph
+            logger.info(
+                f"[Executor] Created meeting room {channel.id} for graph {graph.id}"
+            )
+
+            # Post an introductory embed in the meeting room
+            try:
+                embed = discord.Embed(
+                    title=f"Meeting Room: {graph.goal[:80]}",
+                    description=(
+                        f"This channel is the workspace for plan `{graph.id}`.\n"
+                        f"Agent dispatches and responses happen here.\n"
+                        f"Final answers will be delivered to the main channel."
+                    ),
+                    color=COLOR_PLAN,
+                )
+                await channel.send(embed=embed)
+            except discord.HTTPException:
+                pass
+
+            return channel.id
+        return None
+
+    def get_graph_by_project_channel(self, channel_id: int) -> Optional[JobGraph]:
+        """Get the active graph that owns a project channel."""
+        graph = self._project_channel_to_graph.get(channel_id)
+        if graph and graph.status == GraphStatus.ACTIVE:
+            return graph
+        return None
+
+    def get_active_project_channel_ids(self) -> set[int]:
+        """Get all channel IDs of active meeting rooms."""
+        return {
+            ch_id
+            for ch_id, graph in self._project_channel_to_graph.items()
+            if graph.status == GraphStatus.ACTIVE
+        }
 
     # --------------------------------------------------
     # EMBED HELPERS
@@ -474,6 +568,28 @@ class JobGraphExecutor:
         except discord.HTTPException as e:
             logger.warning(f"[Executor] Failed to delete thread: {e}")
 
+    async def _delete_project_channel(self, graph: JobGraph) -> None:
+        """Delete a graph's meeting room channel."""
+        if not graph.project_channel_id:
+            return
+
+        # Post a farewell message before deletion
+        try:
+            channel = self.bot.get_channel(graph.project_channel_id)
+            if channel:
+                status = "completed" if graph.status == GraphStatus.COMPLETED else "ended"
+                await channel.send(f"Plan {status}. This channel will be deleted shortly.")
+                await asyncio.sleep(3)
+        except discord.HTTPException:
+            pass
+
+        if self.channel_manager:
+            await self.channel_manager.delete_project_channel(graph.project_channel_id)
+
+        # Clean up index
+        if graph.project_channel_id in self._project_channel_to_graph:
+            del self._project_channel_to_graph[graph.project_channel_id]
+
     async def post_to_thread(self, graph: JobGraph, message: str) -> None:
         """Post a plain text message to a graph's planning thread (legacy compat)."""
         if not graph.thread_id:
@@ -509,6 +625,8 @@ class JobGraphExecutor:
                 if graph.status != GraphStatus.ACTIVE and graph.created_at < cutoff:
                     if graph.thread_id and graph.thread_id in self._thread_to_graph:
                         del self._thread_to_graph[graph.thread_id]
+                    if graph.project_channel_id and graph.project_channel_id in self._project_channel_to_graph:
+                        del self._project_channel_to_graph[graph.project_channel_id]
                     cleaned += 1
                 else:
                     remaining.append(graph)
