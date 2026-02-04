@@ -18,6 +18,7 @@ from shared.agent_coordinator import (
 from shared.discord_utils import is_from_known_agent, convert_text_mentions_to_discord
 from shared.agent_messaging import parse_node_marker, strip_node_marker
 from shared.job_graph.executor import JobGraphExecutor
+from shared.conversation.sentinel import ContextSentinel
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,9 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
 
         # Distributed tracker for inter-agent communication
         self.tracker: Optional[DistributedAgentTracker] = None
+
+        # Context sentinel for passive chat monitoring
+        self.sentinel: Optional[ContextSentinel] = None
 
         # Track message IDs we've acknowledged to avoid duplicate acks
         self._acknowledged_message_ids: set = set()
@@ -148,6 +152,15 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
                 except ImportError as e:
                     logger.warning(f"Redis managers not available: {e}")
 
+            # Initialize context sentinel (requires Redis)
+            if Config.REDIS_URL:
+                self.sentinel = ContextSentinel(
+                    redis_url=Config.REDIS_URL,
+                    memory_manager=self.memory_manager,
+                    utility_llm=self.utility_llm if hasattr(self, 'utility_llm') else None,
+                )
+                logger.info("Context Sentinel initialized")
+
             # Load agent registry for @mention support
             self._agent_registry = self._load_agent_registry()
 
@@ -195,6 +208,8 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
 
     def cog_unload(self):
         self.message_queue.stop()
+        if self.sentinel:
+            asyncio.create_task(self.sentinel.shutdown())
 
     # --------------------------------------------------
     # NODE TIMEOUT CALLBACK
@@ -258,6 +273,12 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
             if graph:
                 return  # This is a planning thread, ignore
 
+        # Passive context monitoring — observe after filtering out
+        # self-messages (line 254) and planning threads (above) so that
+        # internal orchestration noise never enters the sentinel buffer.
+        if self.sentinel:
+            await self.sentinel.observe(message, self._agent_registry)
+
         # Determine message source
         is_from_user = message.author.id == Config.ALLOWED_USER_ID
         is_mentioned = self.bot.user and self.bot.user.mentioned_in(message)
@@ -278,14 +299,11 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
         if content.startswith('!'):
             return
 
-        # Ignore user messages that @mention other agents (but not Vega)
-        if is_from_user and not is_mentioned and self._agent_registry:
-            mentions_other_agent = any(
-                f"<@{uid}>" in message.content or f"<@!{uid}>" in message.content
-                for name, uid in self._agent_registry.items()
-                if name != "vega"
-            )
-            if mentions_other_agent:
+        # Ignore user messages that @mention anyone other than Vega
+        # (covers both registered agents and external bots like Sirius)
+        if is_from_user and not is_mentioned and message.mentions:
+            other_mentions = [u for u in message.mentions if u != self.bot.user]
+            if other_mentions:
                 return
 
         # ---- AGENT MESSAGE: route to graph node ----

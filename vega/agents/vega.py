@@ -64,15 +64,15 @@ The goal is to keep related work in ONE graph. Only create a new graph when:
 
 NODE TYPES:
 - `think`: You reason internally (no external dispatch). Mark complete with `update_node` when done.
-- `dispatch`: Sends @mention to an agent. Set appropriate timeout (30-300s).
+- `dispatch`: Sends @mention to an agent. Set appropriate timeout (300s default).
 - `respond`: Delivers final answer to user. Use `respond_to_user` tool.
 
 TIMEOUT GUIDELINES:
-- Quick status check: 30s
-- File read/simple command: 60s
+- Quick status check: 300s
+- File read/simple command: 300s
 - Build/deploy: 300s
-- Web research: 120s
-- Calendar operation: 60s
+- Web research: 300s
+- Calendar operation: 300s
 
 CHAT HISTORY:
 Messages appear as "[Name]: message".

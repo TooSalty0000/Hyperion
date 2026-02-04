@@ -470,8 +470,9 @@ class MemoryManager:
         promoted_ids = []
 
         for memory in memories[:excess_count]:
-            # Auto-categorize based on keywords or default
-            category = self._suggest_category(memory.content, memory.keywords)
+            # Preserve category if already set (e.g. sentinel's passive_context),
+            # otherwise auto-categorize based on content keywords.
+            category = memory.category or self._suggest_category(memory.content, memory.keywords)
             await self.promote_to_long_term(
                 agent_id=agent_id,
                 memory_id=memory.id,

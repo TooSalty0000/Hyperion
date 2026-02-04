@@ -605,6 +605,7 @@ When you learn something important about websites or research findings, use stor
                 user_id=context.user_id,
                 current_agent_id="canopus",
                 conversation_id=context.conversation_id,
+                is_dispatched=bool(context.node_marker),
             )
 
             # Run agent loop

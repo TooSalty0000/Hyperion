@@ -368,8 +368,10 @@ class MarkGoalCompleteTool(Tool):
         else:
             base_response = f"❌ Goal not achieved.\n\nReason: {summary}"
 
-        # Handle handoff if requested and goal succeeded
-        if handoff_to and success:
+        # Handle handoff if requested and goal succeeded.
+        # Skip direct handoff message when dispatched — the cog's response
+        # already routes to the dispatching agent via the node marker.
+        if handoff_to and success and not context.is_dispatched:
             handoff_result = await self._handle_handoff(
                 context=context,
                 findings_summary=summary,

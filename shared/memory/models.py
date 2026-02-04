@@ -192,4 +192,5 @@ DEFAULT_CATEGORIES = {
     "technical_notes": "Technical details, solutions, and patterns discovered",
     "conversation_highlights": "Important moments from past conversations",
     "workflow_patterns": "Agent's learned workflows and effective approaches",
+    "passive_context": "Summarized observations from passively monitored chat messages",
 }

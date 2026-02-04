@@ -77,7 +77,7 @@ class TaskState:
 @dataclass
 class QueuedMessage:
     """A message waiting to be processed."""
-    message: discord.Message
+    message: Optional[discord.Message]  # None for system-triggered messages
     context: Any  # AgentContext
     is_from_agent: bool
     queued_at: datetime = field(default_factory=datetime.now)
@@ -334,7 +334,7 @@ Reply with ONLY one word:
 
     async def enqueue(
         self,
-        message: discord.Message,
+        message: Optional[discord.Message],
         context: Any,
         is_from_agent: bool,
     ) -> Tuple[bool, str, Optional[RecentTask]]:
@@ -347,7 +347,7 @@ Reply with ONLY one word:
         - Queue is full
 
         Args:
-            message: Discord message
+            message: Discord message (None for system-triggered like timeouts)
             context: AgentContext for processing
             is_from_agent: Whether message is from another agent
 
@@ -363,16 +363,18 @@ Reply with ONLY one word:
               - "queued:<position>" if enqueued behind others
             - recent_task: RecentTask if duplicate, None otherwise
         """
-        msg_id = message.id
+        # System-triggered messages (e.g. timeouts) have no Discord message
+        msg_id = message.id if message else 0
 
         # Cleanup old tasks periodically
         self._cleanup_old_tasks()
 
-        # Check for exact duplicate message ID
-        if msg_id in self._processed_message_ids:
+        # Check for exact duplicate message ID (skip for system messages with id=0)
+        if msg_id and msg_id in self._processed_message_ids:
+            content_preview = message.content[:50] if message else context.message_content[:50]
             logger.warning(
                 f"[{self.agent_name}] DUPLICATE MSG ID: {msg_id} already seen, skipping. "
-                f"Content: {message.content[:50]}..."
+                f"Content: {content_preview}..."
             )
             return False, "duplicate_id", None
 
@@ -455,8 +457,9 @@ Reply with ONLY one word:
             task_context_when_queued=task_context,
         )
 
-        # Track this message ID
-        self._processed_message_ids.add(msg_id)
+        # Track this message ID (skip system messages with id=0)
+        if msg_id:
+            self._processed_message_ids.add(msg_id)
         if len(self._processed_message_ids) > self._max_tracked_ids:
             oldest = next(iter(self._processed_message_ids))
             self._processed_message_ids.discard(oldest)
@@ -465,9 +468,10 @@ Reply with ONLY one word:
         if is_from_agent:
             self._current_task_hash = self._hash_content(context.message_content)
 
+        content_preview = message.content[:50] if message else context.message_content[:50]
         logger.info(
             f"[{self.agent_name}] ENQUEUE: msg_id={msg_id}, from_agent={is_from_agent}, "
-            f"position={position}, busy={self._is_processing}, content={message.content[:50]}..."
+            f"position={position}, busy={self._is_processing}, content={content_preview}..."
         )
 
         await self._queue.put(item)
@@ -512,7 +516,7 @@ Reply with ONLY one word:
 
                 # Create rich task state
                 source_agent = None
-                if item.is_from_agent:
+                if item.is_from_agent and item.message:
                     # Try to extract source agent name from message
                     source_agent = getattr(item.message.author, 'name', None)
 
@@ -561,12 +565,13 @@ Reply with ONLY one word:
                     logger.error(f"[{self.agent_name}] PROCESS FAILED: msg_id={item.message_id}, error={e}")
 
                     # Try to notify the channel
-                    try:
-                        await item.message.channel.send(
-                            f"Sorry, I encountered an error processing your message: {str(e)[:200]}"
-                        )
-                    except Exception:
-                        pass
+                    if item.message:
+                        try:
+                            await item.message.channel.send(
+                                f"Sorry, I encountered an error processing your message: {str(e)[:200]}"
+                            )
+                        except Exception:
+                            pass
 
                 finally:
                     self._current_item = None

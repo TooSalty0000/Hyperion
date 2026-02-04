@@ -525,7 +525,8 @@ class PolarisCore(commands.Cog, AgentAcknowledgmentMixin):
 
             # Send completion reaction for inter-agent messages
             # This tells other agents we've finished processing
-            if is_from_agent:
+            # Only mark done if we actually sent a response
+            if is_from_agent and response.content and should_send:
                 try:
                     await message.add_reaction(REACTION_DONE)
                     logger.info(f"[Polaris] Sent ✔️ completion for message {message.id}")

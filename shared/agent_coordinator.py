@@ -143,7 +143,7 @@ class DistributedAgentTracker:
         self,
         own_name: str,
         agent_registry: Dict[str, int],
-        ack_timeout: float = 60.0,
+        ack_timeout: float = 300.0,
     ):
         """
         Initialize tracker.

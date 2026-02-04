@@ -112,7 +112,7 @@ class MentionAgentTool(Tool):
             ToolParameter(
                 name="wait_for_ack",
                 type="boolean",
-                description="If true, wait for the agent to acknowledge receipt (max 30s). Default: false",
+                description="If true, wait for the agent to acknowledge receipt (max 300s). Default: false",
                 required=False,
             ),
             ToolParameter(
@@ -208,7 +208,7 @@ class MentionAgentTool(Tool):
 
                 acknowledged = await self._tracker.wait_for_acknowledgment(
                     sent_msg.id,
-                    timeout=30.0
+                    timeout=300.0
                 )
 
                 if acknowledged:

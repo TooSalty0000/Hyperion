@@ -83,13 +83,38 @@ class BrowserSession:
         }
 
         launcher = browser_launchers.get(browser_type, session._playwright.chromium)
-        session._browser = await launcher.launch(headless=headless)
 
-        # Create context with viewport
+        # Anti-detection launch args (chromium only)
+        launch_args = []
+        if browser_type == "chromium":
+            launch_args = [
+                "--disable-blink-features=AutomationControlled",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-infobars",
+                "--disable-dev-shm-usage",
+            ]
+
+        session._browser = await launcher.launch(
+            headless=headless,
+            args=launch_args if launch_args else None,
+        )
+
+        # Create context with viewport and modern user agent
         session._context = await session._browser.new_context(
             viewport={"width": viewport_width, "height": viewport_height},
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            ignore_https_errors=True,
         )
+
+        # Override navigator.webdriver on every page load
+        await session._context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        """)
 
         # Create initial page
         session._page = await session._context.new_page()

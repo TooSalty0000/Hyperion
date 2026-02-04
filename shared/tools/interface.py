@@ -48,6 +48,10 @@ class ToolContext:
     # Response message (set by RespondToUserTool, read by cog)
     response_message: Optional[str] = None
 
+    # True when this agent was dispatched by another agent (has a node marker).
+    # Used by cognitive tools to skip redundant handoff messages.
+    is_dispatched: bool = False
+
     # Set by graph tools when DISPATCH nodes are sent to agents.
     # Signals Vega's process loop to yield and wait for agent responses.
     dispatched_to_agents: bool = False

@@ -348,7 +348,7 @@ class WaitForCompletionTool(Tool):
             ToolParameter(
                 name="timeout_seconds",
                 type="integer",
-                description="Maximum time to wait in seconds. Default 60.",
+                description="Maximum time to wait in seconds. Default 300.",
                 required=False,
             ),
             ToolParameter(
@@ -363,7 +363,7 @@ class WaitForCompletionTool(Tool):
         self,
         context: ToolContext,
         session_id: int = None,
-        timeout_seconds: int = 60,
+        timeout_seconds: int = 300,
         completion_pattern: str = None
     ) -> str:
         """Wait for completion."""
