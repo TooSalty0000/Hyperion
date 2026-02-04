@@ -385,11 +385,17 @@ class UpdateNodeTool(Tool):
         # Cancel the per-node timeout task (if any)
         executor.cancel_timeout(graph_id, node_id)
 
-        # Dispatch any newly ready nodes
+        # Dispatch any newly ready nodes (sequential-per-agent aware)
         dispatched = await executor.dispatch_ready_nodes(graph)
 
+        # Sequential-per-agent: if a dispatch agent was freed, check other graphs
+        cross_graph_dispatched = []
+        if node.type == NodeType.DISPATCH and node.agent and status in ("completed", "failed"):
+            cross_graph_dispatched = await executor.dispatch_next_for_agent(node.agent)
+        all_dispatched = dispatched + cross_graph_dispatched
+
         # Signal that we dispatched to external agents (Vega should yield and wait)
-        has_agent_dispatch = any(n.type == NodeType.DISPATCH for n in dispatched)
+        has_agent_dispatch = any(n.type == NodeType.DISPATCH for n in all_dispatched)
         if has_agent_dispatch:
             context.dispatched_to_agents = True
 
@@ -401,7 +407,7 @@ class UpdateNodeTool(Tool):
             await executor.complete_graph(graph)
             return f"Node '{node_id}' marked {status}. ALL NODES COMPLETE - goal achieved!"
 
-        dispatch_info = f" {len(dispatched)} new nodes dispatched." if dispatched else ""
+        dispatch_info = f" {len(all_dispatched)} new nodes dispatched." if all_dispatched else ""
         return f"Node '{node_id}' marked {status}.{dispatch_info}"
 
 
@@ -515,7 +521,7 @@ class RespondToUserTool(Tool):
                     context.response_channel_id = g.channel_id
                     break
 
-        # Find the graph and complete it
+        # Find the graph and conditionally complete it
         if graph_id:
             graph_found = False
             for g in executor.get_all_active_graphs():
@@ -525,11 +531,28 @@ class RespondToUserTool(Tool):
                     for node in g.nodes.values():
                         if node.type == NodeType.RESPOND and node.status == NodeStatus.RUNNING:
                             g.mark_completed(node.id, message[:200])
-                    # Complete the graph (posts embed + deletes thread)
-                    try:
-                        await executor.complete_graph(g)
-                    except Exception as e:
-                        logger.warning(f"[RespondToUser] Graph cleanup failed: {e}")
+
+                    # Only complete the graph if no dispatch/think nodes are still active
+                    active_work_nodes = [
+                        n for n in g.nodes.values()
+                        if n.type in (NodeType.DISPATCH, NodeType.THINK)
+                        and n.status in (
+                            NodeStatus.RUNNING, NodeStatus.PENDING, NodeStatus.READY
+                        )
+                    ]
+
+                    if active_work_nodes:
+                        active_ids = [n.id for n in active_work_nodes]
+                        logger.info(
+                            f"[RespondToUser] Graph '{graph_id}' still has active nodes "
+                            f"{active_ids}, sending response but keeping graph alive."
+                        )
+                    else:
+                        # All work is done — complete the graph (posts embed + cleans up)
+                        try:
+                            await executor.complete_graph(g)
+                        except Exception as e:
+                            logger.warning(f"[RespondToUser] Graph cleanup failed: {e}")
                     break
 
             if not graph_found:

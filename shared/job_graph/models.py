@@ -43,7 +43,7 @@ class JobNode:
     agent: Optional[str] = None          # For DISPATCH nodes: "altair", "polaris", "canopus"
     dependencies: list[str] = field(default_factory=list)  # Node IDs that must complete first
     status: NodeStatus = NodeStatus.PENDING
-    timeout: int = 120                   # Seconds, set by Vega's LLM per node
+    timeout: int = 300                   # Seconds, set by Vega's LLM per node
     result: Optional[str] = None         # Result/output after completion
     error: Optional[str] = None          # Error message if failed
     message_id: Optional[int] = None     # Discord message ID of dispatched mention
@@ -168,8 +168,10 @@ class JobGraph:
             self._update_ready_nodes()
 
     def get_ready_nodes(self) -> list[JobNode]:
-        """Get all nodes that are ready to execute (dependencies met)."""
-        return [n for n in self.nodes.values() if n.status == NodeStatus.READY]
+        """Get all nodes that are ready to execute (dependencies met), oldest first."""
+        ready = [n for n in self.nodes.values() if n.status == NodeStatus.READY]
+        ready.sort(key=lambda n: n.created_at)
+        return ready
 
     def get_running_nodes(self) -> list[JobNode]:
         """Get all currently running nodes."""

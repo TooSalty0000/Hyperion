@@ -130,6 +130,9 @@ class JobGraphExecutor:
         Dispatch all READY nodes in a graph.
 
         For DISPATCH nodes: sends @mentions to the target agent in the main channel.
+        Sequential-per-agent: only one DISPATCH node per agent may be RUNNING
+        at a time (across all active graphs).  Additional READY nodes for a
+        busy agent are deferred until the running node completes or fails.
         For THINK nodes: marks as running (Vega handles internally).
         For RESPOND nodes: marks as running (Vega handles internally).
 
@@ -139,11 +142,21 @@ class JobGraphExecutor:
         dispatched = []
         ready_nodes = graph.get_ready_nodes()
 
+        # Sequential-per-agent: track which agents already have running work
+        busy_agents = self._get_running_dispatch_agents()
+
         for node in ready_nodes:
             if node.type == NodeType.DISPATCH:
+                if node.agent in busy_agents:
+                    logger.debug(
+                        f"[Executor] Deferring node '{node.id}' — "
+                        f"agent '{node.agent}' already has a running dispatch node"
+                    )
+                    continue
                 success = await self._dispatch_to_agent(graph, node)
                 if success:
                     dispatched.append(node)
+                    busy_agents.add(node.agent)
             elif node.type in (NodeType.THINK, NodeType.RESPOND):
                 # These are handled by Vega's LLM directly
                 graph.mark_running(node.id)
@@ -250,6 +263,14 @@ class JobGraphExecutor:
                         await self._on_timeout_callback(graph, node)
                     except Exception as cb_err:
                         logger.error(f"[Executor] Timeout callback error: {cb_err}")
+                # Sequential-per-agent: agent is now free, dispatch next queued node
+                if node.agent:
+                    try:
+                        await self.dispatch_next_for_agent(node.agent)
+                    except Exception as dispatch_err:
+                        logger.error(
+                            f"[Executor] dispatch_next_for_agent error: {dispatch_err}"
+                        )
             except asyncio.CancelledError:
                 pass  # Normal cancellation when agent responds in time
             finally:
@@ -277,6 +298,64 @@ class JobGraphExecutor:
                 task.cancel()
         if keys_to_remove:
             logger.debug(f"[Executor] Cancelled {len(keys_to_remove)} timeouts for graph {graph_id}")
+
+    # --------------------------------------------------
+    # SEQUENTIAL-PER-AGENT DISPATCH
+    # --------------------------------------------------
+
+    def _get_running_dispatch_agents(self) -> set[str]:
+        """Get agent names that currently have RUNNING dispatch nodes across all active graphs."""
+        running = set()
+        for graphs in self._graphs.values():
+            for graph in graphs:
+                if graph.status != GraphStatus.ACTIVE:
+                    continue
+                for node in graph.nodes.values():
+                    if (node.type == NodeType.DISPATCH
+                            and node.status == NodeStatus.RUNNING
+                            and node.agent):
+                        running.add(node.agent)
+        return running
+
+    def _agent_has_running_dispatch(self, agent_name: str) -> bool:
+        """Check if a specific agent has any RUNNING dispatch node."""
+        for graphs in self._graphs.values():
+            for graph in graphs:
+                if graph.status != GraphStatus.ACTIVE:
+                    continue
+                for node in graph.nodes.values():
+                    if (node.type == NodeType.DISPATCH
+                            and node.status == NodeStatus.RUNNING
+                            and node.agent == agent_name):
+                        return True
+        return False
+
+    async def dispatch_next_for_agent(self, agent_name: str) -> list[JobNode]:
+        """
+        Dispatch the next READY node for an agent across all active graphs.
+
+        Called after an agent's dispatch node completes/fails to unblock
+        queued work in other graphs.  Respects sequential-per-agent: only
+        dispatches if the agent has no other RUNNING dispatch node.
+
+        Returns:
+            List containing the single dispatched node, or empty list.
+        """
+        if not agent_name or self._agent_has_running_dispatch(agent_name):
+            return []
+
+        for graphs in self._graphs.values():
+            for graph in graphs:
+                if graph.status != GraphStatus.ACTIVE:
+                    continue
+                for node in graph.get_ready_nodes():
+                    if node.type == NodeType.DISPATCH and node.agent == agent_name:
+                        success = await self._dispatch_to_agent(graph, node)
+                        if success:
+                            if graph.thread_id:
+                                await self._post_status_embed(graph)
+                            return [node]
+        return []
 
     # --------------------------------------------------
     # MARKER-BASED NODE LOOKUP
