@@ -577,7 +577,7 @@ When you need to recall past information, check your active context above or use
         Checks for new messages during long-running operations to stay
         responsive to user input and other agent responses.
         """
-        from shared.tools.interface import ToolContext
+        from shared.tools.interface import ToolContext, CancellationToken
 
         start_time = time.time()
 
@@ -599,6 +599,9 @@ When you need to recall past information, check your active context above or use
             # Get tool definitions
             tool_defs = self.tools.get_definitions()
 
+            # Create cancellation token for cooperative interruption
+            cancellation_token = CancellationToken()
+
             # Create tool context for execution
             tool_context = ToolContext(
                 session_registry=self.session_registry,
@@ -608,6 +611,7 @@ When you need to recall past information, check your active context above or use
                 memory_manager=self.memory_manager,
                 discord_bot=self.discord_bot,
                 permission_manager=self._permission_manager,
+                cancellation_token=cancellation_token,
                 current_session_id=self._current_session_id,
                 current_channel_id=context.channel_id,
                 current_guild_id=context.guild_id,
@@ -855,6 +859,17 @@ When you need to recall past information, check your active context above or use
             messages.append(
                 Message(role=Role.USER, content=f"[{user_name}]: {context.message_content}")
             )
+
+        # Inject recent task context so the LLM knows what it just finished
+        if context.recent_task_summary:
+            messages.append(Message(
+                role=Role.SYSTEM,
+                content=(
+                    f"[RECENT WORK]\n{context.recent_task_summary}\n\n"
+                    "Consider whether this new message relates to your recent work. "
+                    "Reuse existing resources (sessions, browser tabs, etc.) when appropriate."
+                ),
+            ))
 
         return messages
 

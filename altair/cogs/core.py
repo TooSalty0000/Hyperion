@@ -83,10 +83,11 @@ class AltairCore(commands.Cog, AgentAcknowledgmentMixin):
         # Workflow state provider for context awareness
         self.workflow_state_provider = QueueWorkflowStateProvider("Altair")
 
-        # Message queue for sequential processing
+        # Message queue with concurrent processing (up to 3 tasks at once)
         self.message_queue = AgentMessageQueue(
             agent_name="Altair",
             process_callback=self._process_queued_message,
+            max_concurrent=3,
         )
 
         # Connect workflow state provider to the queue
@@ -363,6 +364,11 @@ class AltairCore(commands.Cog, AgentAcknowledgmentMixin):
 
         content = message.content.strip()
 
+        # Intercept stop messages BEFORE queuing — immediate cancellation
+        if is_allowed_user and self._is_stop_message(content):
+            await self._handle_immediate_stop(message)
+            return
+
         # Handle !vp commands (project management)
         if content.startswith('!vp'):
             await self._handle_vp_command(message, content)
@@ -449,6 +455,15 @@ class AltairCore(commands.Cog, AgentAcknowledgmentMixin):
                 )
                 return
 
+        # User (not agent) message while task is active in this channel →
+        # don't enqueue, let the running task's _fetch_new_messages_since() handle it
+        if not is_from_agent and self.message_queue.has_active_task_for_channel(message.channel.id):
+            logger.info(
+                f"[Altair] ADJUSTMENT routed to running task: '{clean_content[:50]}...'"
+            )
+            await message.add_reaction("\U0001f442")  # 👂
+            return
+
         # Extract node marker from dispatch content (if present)
         node_marker = None
         if is_from_agent:
@@ -490,6 +505,17 @@ class AltairCore(commands.Cog, AgentAcknowledgmentMixin):
             guild_id=message.guild.id if message.guild else None
         )
 
+        # Build recent task context for the LLM
+        recent_task_summary = None
+        recent = self.message_queue.get_recent_completion(message.channel.id)
+        if recent:
+            recent_task_summary = (
+                f"You recently completed a task in this channel ({recent.elapsed_seconds}s ago): "
+                f"{recent.content[:200]}"
+            )
+            if recent.tools_used:
+                recent_task_summary += f"\nTools used: {', '.join(recent.tools_used[-5:])}"
+
         # Create agent context
         context = AgentContext(
             channel_id=message.channel.id,
@@ -500,6 +526,7 @@ class AltairCore(commands.Cog, AgentAcknowledgmentMixin):
             conversation_id=conversation_id,
             is_from_agent=is_from_agent,
             node_marker=node_marker,
+            recent_task_summary=recent_task_summary,
         )
 
         # Add to queue for sequential processing
@@ -835,6 +862,40 @@ Should Altair respond to this message? Answer only YES or NO."""
                     return True
 
         return False
+
+    # Stop message patterns (mirrored from AltairAgent.STOP_PATTERNS)
+    _STOP_PATTERNS = [
+        r"^stop\b",
+        r"^wait\b",
+        r"^hold\b",
+        r"^cancel\b",
+        r"^abort\b",
+        r"^pause\b",
+        r"^nevermind\b",
+        r"^never\s*mind\b",
+        r"\bstop\s+that\b",
+        r"\bcancel\s+that\b",
+        r"\bhold\s+on\b",
+        r"\bwait\s+a\s+(sec|minute|moment)\b",
+    ]
+
+    def _is_stop_message(self, content: str) -> bool:
+        """Check if message content matches stop patterns."""
+        import re
+        content_lower = content.lower().strip()
+        for pattern in self._STOP_PATTERNS:
+            if re.search(pattern, content_lower, re.IGNORECASE):
+                return True
+        return False
+
+    async def _handle_immediate_stop(self, message: discord.Message):
+        """Cancel all active tasks immediately, bypassing the queue."""
+        cancelled = self.message_queue.cancel_all_tasks()
+        await message.add_reaction("\U0001f6d1")  # 🛑
+        if cancelled > 0:
+            await message.channel.send(f"Stopped {cancelled} active task(s).")
+        else:
+            await message.channel.send("No active tasks to stop.")
 
     async def _send_response(self, channel: discord.TextChannel, content: str):
         """Send a response, splitting if necessary. Sent silently (no push notification)."""

@@ -342,12 +342,24 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
                 guild_id=message.guild.id if message.guild else None,
             )
 
+            # Build recent task context for the LLM
+            recent_task_summary = None
+            recent = self.message_queue.get_recent_completion(message.channel.id)
+            if recent:
+                recent_task_summary = (
+                    f"You recently completed a task in this channel ({recent.elapsed_seconds}s ago): "
+                    f"{recent.content[:200]}"
+                )
+                if recent.tools_used:
+                    recent_task_summary += f"\nTools used: {', '.join(recent.tools_used[-5:])}"
+
             context = AgentContext(
                 channel_id=message.channel.id,
                 user_id=message.author.id,
                 message_content=content,
                 guild_id=message.guild.id if message.guild else None,
                 conversation_id=conversation_id,
+                recent_task_summary=recent_task_summary,
             )
 
             await self.message_queue.enqueue(

@@ -27,6 +27,7 @@ class AgentContext:
     session_id: Optional[int] = None
     is_from_agent: bool = False  # True when dispatched by another agent (e.g. Vega)
     node_marker: Optional[str] = None  # e.g. "[node:abc12345:n1]" from dispatch message
+    recent_task_summary: Optional[str] = None  # What agent just finished in this channel
 
 
 @dataclass

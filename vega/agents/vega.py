@@ -348,11 +348,27 @@ When you need to recall past information, check your active context above or use
 
             # Run agent loop - Vega may need multiple iterations to build a plan
             max_iterations = 10
+            processing_started = datetime.now(timezone.utc)
+            seen_message_ids: set[int] = set()
+
             for iteration in range(max_iterations):
                 logger.debug(
                     f"[Vega] ITERATION {iteration + 1}/{max_iterations}: "
                     f"tools_so_far={tool_calls_made}, messages={len(messages)}"
                 )
+
+                # Check for new user messages mid-planning
+                if iteration > 0:
+                    new_msgs = await self._fetch_new_messages_since(
+                        context.channel_id, processing_started, seen_message_ids
+                    )
+                    if new_msgs:
+                        logger.info(f"Vega detected {len(new_msgs)} new message(s) during processing")
+                        messages.append(Message(
+                            role=Role.SYSTEM,
+                            content="[NEW MESSAGES RECEIVED]\nThe user sent additional input. Consider adjusting your plan."
+                        ))
+                        messages.extend(new_msgs)
 
                 # Get LLM response
                 response = await self.llm.complete(
@@ -503,6 +519,17 @@ When you need to recall past information, check your active context above or use
             Message(role=Role.USER, content=f"[{user_name}]: {context.message_content}")
         )
 
+        # Inject recent task context for continuity
+        if context.recent_task_summary:
+            messages.append(Message(
+                role=Role.SYSTEM,
+                content=(
+                    f"[RECENT WORK]\n{context.recent_task_summary}\n\n"
+                    "Consider whether this new message relates to your recent work. "
+                    "Reuse existing resources (sessions, browser tabs, etc.) when appropriate."
+                ),
+            ))
+
         return messages
 
     async def _fetch_discord_history(
@@ -559,6 +586,65 @@ When you need to recall past information, check your active context above or use
 
         except Exception as e:
             logger.warning(f"Failed to fetch Discord history: {e}")
+            return []
+
+    async def _fetch_new_messages_since(
+        self,
+        channel_id: int,
+        since: datetime,
+        seen_ids: set[int],
+    ) -> List[Message]:
+        """
+        Fetch messages posted after a given timestamp, excluding already-seen messages.
+
+        Used during processing to check for new user input that should
+        influence the current planning cycle.
+
+        Args:
+            channel_id: Discord channel ID
+            since: Fetch messages after this timestamp
+            seen_ids: Set of message IDs already processed (will be updated in-place)
+        """
+        if not self.discord_bot:
+            return []
+
+        try:
+            from shared.discord_utils import resolve_message_content, get_author_display_name
+
+            channel = self.discord_bot.get_channel(channel_id)
+            if not channel:
+                return []
+
+            new_messages = []
+            async for msg in channel.history(limit=10, after=since):
+                if msg.id in seen_ids:
+                    continue
+                if not msg.content or not msg.content.strip():
+                    continue
+
+                seen_ids.add(msg.id)
+
+                content = await resolve_message_content(
+                    msg, self.discord_bot, self.agent_registry
+                )
+                if not content.strip():
+                    continue
+
+                author_name = get_author_display_name(msg, self.agent_registry)
+
+                if msg.author.bot:
+                    role = Role.ASSISTANT
+                else:
+                    role = Role.USER
+
+                formatted = f"[NEW - {author_name}]: {content}"
+                new_messages.append(Message(role=role, content=formatted))
+
+            new_messages.reverse()
+            return new_messages
+
+        except Exception as e:
+            logger.warning(f"Failed to fetch new messages: {e}")
             return []
 
 

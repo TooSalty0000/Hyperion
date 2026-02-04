@@ -1,7 +1,8 @@
 """Tool interface and context for agent execution."""
 
+import asyncio
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional, List, TYPE_CHECKING
 
 from shared.llm.types import ToolDefinition, ToolParameter
@@ -9,6 +10,35 @@ from shared.llm.types import ToolDefinition, ToolParameter
 if TYPE_CHECKING:
     from shared.session import SessionRegistry
     from shared.channel import ChannelManager
+
+
+class CancellationToken:
+    """Cooperative cancellation for long-running tool operations.
+
+    Tools can check ``is_cancelled`` or use ``sleep()`` as a drop-in
+    replacement for ``asyncio.sleep()`` that raises ``CancelledError``
+    when the token is signalled.
+    """
+
+    def __init__(self):
+        self._event = asyncio.Event()
+
+    def cancel(self):
+        """Signal cancellation."""
+        self._event.set()
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._event.is_set()
+
+    async def sleep(self, seconds: float):
+        """Cancellation-aware sleep. Raises ``CancelledError`` if cancelled."""
+        try:
+            await asyncio.wait_for(self._event.wait(), timeout=seconds)
+            # event.wait() returned → cancellation was signalled
+            raise asyncio.CancelledError("Task cancelled via CancellationToken")
+        except asyncio.TimeoutError:
+            pass  # Normal timeout, continue
 
 
 @dataclass
@@ -48,6 +78,9 @@ class ToolContext:
     # Response message (set by RespondToUserTool, read by cog)
     response_message: Optional[str] = None
 
+    # Cancellation token for cooperative interruption of long-running tools.
+    cancellation_token: Optional['CancellationToken'] = None
+
     # True when this agent was dispatched by another agent (has a node marker).
     # Used by cognitive tools to skip redundant handoff messages.
     is_dispatched: bool = False
@@ -73,6 +106,7 @@ class ToolContext:
             permission_manager=self.permission_manager,
             browser_manager=self.browser_manager,
             scratchpad=self.scratchpad,
+            cancellation_token=self.cancellation_token,
             current_session_id=session_id,
             current_channel_id=self.current_channel_id,
             current_guild_id=self.current_guild_id,

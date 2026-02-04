@@ -148,8 +148,12 @@ class MonitorSessionTool(Tool):
             initial_output = await session.terminal.get_output() or ""
             initial_lines = initial_output.split('\n')
 
-            # Watch for changes
-            await asyncio.sleep(watch_seconds)
+            # Watch for changes (cancellation-aware)
+            ct = context.cancellation_token
+            if ct:
+                await ct.sleep(watch_seconds)
+            else:
+                await asyncio.sleep(watch_seconds)
 
             # Get current output
             current_output = await session.terminal.get_output() or ""

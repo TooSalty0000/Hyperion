@@ -410,7 +410,12 @@ class WaitForCompletionTool(Tool):
                         if pattern.search(recent):
                             return f"Operation completed. Pattern detected: {pattern.pattern}"
 
-                await asyncio.sleep(0.5)
+                # Use cancellation-aware sleep if token available
+                ct = context.cancellation_token
+                if ct:
+                    await ct.sleep(0.5)
+                else:
+                    await asyncio.sleep(0.5)
 
         except Exception as e:
             logger.error(f"Error waiting for completion: {e}", exc_info=True)

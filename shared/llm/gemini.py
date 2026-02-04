@@ -379,14 +379,20 @@ class GeminiProvider(LLMProvider):
         # Allow custom response schema via kwargs (e.g., for chime-in decisions)
         response_schema = kwargs.get("response_schema", RESPONSE_SCHEMA)
 
-        config = types.GenerateContentConfig(
+        # Only enforce structured JSON output when no tools are active.
+        # With tools, the LLM needs to write natural text for its final response.
+        # _clean_prompt_leakage() handles safety for unstructured responses.
+        config_kwargs = dict(
             temperature=temperature,
             max_output_tokens=max_tokens or 8192,
             system_instruction=system,
             tools=tool_config,
-            response_mime_type="application/json",
-            response_schema=response_schema,
         )
+        if not tool_config:
+            config_kwargs["response_mime_type"] = "application/json"
+            config_kwargs["response_schema"] = response_schema
+
+        config = types.GenerateContentConfig(**config_kwargs)
 
         last_error = None
         backoff = INITIAL_BACKOFF

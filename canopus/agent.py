@@ -610,6 +610,8 @@ When you learn something important about websites or research findings, use stor
 
             # Run agent loop
             max_iterations = 15  # Limit tool call iterations
+            processing_started = datetime.now(timezone.utc)
+            seen_message_ids: set[int] = set()
 
             for iteration in range(max_iterations):
                 logger.debug(
@@ -617,6 +619,19 @@ When you learn something important about websites or research findings, use stor
                     f"tools_so_far={tool_calls_made}, messages={len(messages)}, "
                     f"goal_achieved={scratchpad.goal_achieved}"
                 )
+
+                # Check for new messages mid-processing (user adjustments)
+                if iteration > 0:
+                    new_msgs = await self._fetch_new_messages_since(
+                        context.channel_id, processing_started, seen_message_ids
+                    )
+                    if new_msgs:
+                        logger.info(f"Canopus detected {len(new_msgs)} new message(s) during processing")
+                        messages.append(Message(
+                            role=Role.SYSTEM,
+                            content="[NEW MESSAGES RECEIVED]\nReview these and decide how to proceed."
+                        ))
+                        messages.extend(new_msgs)
 
                 # Check if goal was achieved (early exit)
                 if scratchpad.goal_achieved:
@@ -656,12 +671,32 @@ When you learn something important about websites or research findings, use stor
 
                 # If no tool calls, we have our final response
                 if not response.tool_calls:
+                    content = response.content
+
+                    # If we did real work but the LLM gave a weak/empty response,
+                    # request a proper summary before returning
+                    if tool_calls_made > 0 and self._is_weak_response(content):
+                        logger.info(
+                            f"[Canopus] WEAK RESPONSE after {tool_calls_made} tool calls, "
+                            f"requesting summary"
+                        )
+                        summary = await self._request_summary(messages, scratchpad)
+                        if summary and not self._is_weak_response(summary):
+                            content = summary
+                        else:
+                            # Last resort: synthesize from scratchpad
+                            content = self._format_scratchpad_response(scratchpad)
+                            logger.info(
+                                f"[Canopus] Used scratchpad synthesis, "
+                                f"len={len(content)}"
+                            )
+
                     processing_time = int((time.time() - start_time) * 1000)
 
                     logger.info(
                         f"[Canopus] FINAL RESPONSE: iteration={iteration + 1}, "
-                        f"tool_calls={tool_calls_made}, has_content={bool(response.content)}, "
-                        f"content_len={len(response.content or '')}"
+                        f"tool_calls={tool_calls_made}, has_content={bool(content)}, "
+                        f"content_len={len(content or '')}"
                     )
 
                     # Store in conversation history
@@ -669,11 +704,11 @@ When you learn something important about websites or research findings, use stor
                         await self.conversation_manager.add_message(
                             context.conversation_id,
                             Role.ASSISTANT.value,
-                            response.content or "",
+                            content or "",
                         )
 
                     return AgentResponse(
-                        content=response.content or "Web operation completed.",
+                        content=content or self._format_scratchpad_response(scratchpad),
                         agent_name=self.name,
                         tool_calls_made=tool_calls_made,
                         processing_time_ms=processing_time,
@@ -725,9 +760,13 @@ When you learn something important about websites or research findings, use stor
                 tools=None,
             )
 
+            content = summary_response.content
+            if not content or self._is_weak_response(content):
+                content = self._format_scratchpad_response(scratchpad)
+
             processing_time = int((time.time() - start_time) * 1000)
             return AgentResponse(
-                content=summary_response.content or "Web operation completed.",
+                content=content,
                 agent_name=self.name,
                 tool_calls_made=tool_calls_made,
                 processing_time_ms=processing_time,
@@ -745,6 +784,101 @@ When you learn something important about websites or research findings, use stor
                 status="error",
                 error=str(e),
             )
+
+    def _is_weak_response(self, content: Optional[str]) -> bool:
+        """Check if a response is too weak to be useful after real tool work."""
+        if not content:
+            return True
+
+        stripped = content.strip()
+        if len(stripped) < 20:
+            return True
+
+        noise_phrases = {
+            "web operation completed",
+            "web operation completed.",
+            "operation completed",
+            "task completed",
+            "task done",
+            "done",
+            "completed",
+            "finished",
+            "acknowledged",
+            "understood",
+        }
+        if stripped.lower().rstrip(".!") in noise_phrases:
+            return True
+
+        # JSON wrapper from structured output: {"message": "..."}
+        if stripped.startswith('{"message"'):
+            try:
+                import json
+                parsed = json.loads(stripped)
+                inner = parsed.get("message", "")
+                if len(inner) < 30:
+                    return True
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+        return False
+
+    async def _request_summary(
+        self,
+        messages: list,
+        scratchpad: "NavigationScratchpad",
+    ) -> Optional[str]:
+        """Ask the LLM to summarize its findings with tools disabled."""
+        findings_text = scratchpad.get_findings_formatted()
+        summary_messages = list(messages)
+        summary_messages.append(
+            Message(
+                role=Role.USER,
+                content=(
+                    "You've completed your tool work. Now write a clear, detailed response "
+                    "summarizing what you found or accomplished. Include:\n"
+                    "1. What was requested\n"
+                    "2. What you found or accomplished\n"
+                    "3. Key URLs visited\n"
+                    "4. Any issues encountered\n\n"
+                    f"Your stored findings:\n{findings_text}\n\n"
+                    "Do NOT make any tool calls. Write a natural response."
+                ),
+            )
+        )
+        try:
+            resp = await self.llm.complete(messages=summary_messages, tools=None)
+            return resp.content
+        except Exception as e:
+            logger.warning(f"[Canopus] Summary request failed: {e}")
+            return None
+
+    def _format_scratchpad_response(self, scratchpad: "NavigationScratchpad") -> str:
+        """Build a response directly from scratchpad data as a last resort."""
+        parts = []
+
+        if scratchpad.goal:
+            parts.append(f"**Task:** {scratchpad.goal}")
+
+        if scratchpad.findings:
+            parts.append("\n**Findings:**")
+            for f in scratchpad.findings:
+                entry = f"- **{f.key}**: {f.value}"
+                if f.url:
+                    entry += f" ({f.url})"
+                parts.append(entry)
+
+        if scratchpad.visited_urls:
+            parts.append(f"\n**URLs visited:** {len(scratchpad.visited_urls)}")
+            for url in scratchpad.visited_urls[:5]:
+                parts.append(f"- {url}")
+
+        if scratchpad.goal_achieved:
+            parts.append(f"\n**Status:** Completed — {scratchpad.completion_reason}")
+
+        if parts:
+            return "\n".join(parts)
+
+        return "Web research completed but no structured findings were recorded."
 
     async def _build_messages(
         self,
@@ -789,6 +923,17 @@ When you learn something important about websites or research findings, use stor
             messages.append(
                 Message(role=Role.USER, content=f"[{user_name}]: {context.message_content}")
             )
+
+        # Inject recent task context so the LLM knows what it just finished
+        if context.recent_task_summary:
+            messages.append(Message(
+                role=Role.SYSTEM,
+                content=(
+                    f"[RECENT WORK]\n{context.recent_task_summary}\n\n"
+                    "Consider whether this new message relates to your recent work. "
+                    "Reuse existing resources (sessions, browser tabs, etc.) when appropriate."
+                ),
+            ))
 
         return messages
 

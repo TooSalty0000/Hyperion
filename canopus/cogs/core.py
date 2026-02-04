@@ -283,6 +283,12 @@ class CanopusCore(commands.Cog, AgentAcknowledgmentMixin):
                 )
                 return
 
+        # Thinking layer: user message while task is active → route to running task
+        if not is_from_agent and self.message_queue.has_active_task_for_channel(message.channel.id):
+            logger.info(f"[Canopus] ADJUSTMENT routed to running task: '{clean_content[:50]}...'")
+            await message.add_reaction("\U0001f442")  # 👂
+            return
+
         # Extract node marker from dispatch content (if present)
         node_marker = None
         if is_from_agent:
@@ -324,6 +330,17 @@ class CanopusCore(commands.Cog, AgentAcknowledgmentMixin):
             guild_id=message.guild.id if message.guild else None
         )
 
+        # Build recent task context for the LLM
+        recent_task_summary = None
+        recent = self.message_queue.get_recent_completion(message.channel.id)
+        if recent:
+            recent_task_summary = (
+                f"You recently completed a task in this channel ({recent.elapsed_seconds}s ago): "
+                f"{recent.content[:200]}"
+            )
+            if recent.tools_used:
+                recent_task_summary += f"\nTools used: {', '.join(recent.tools_used[-5:])}"
+
         # Create agent context
         context = AgentContext(
             channel_id=message.channel.id,
@@ -334,6 +351,7 @@ class CanopusCore(commands.Cog, AgentAcknowledgmentMixin):
             conversation_id=conversation_id,
             is_from_agent=is_from_agent,
             node_marker=node_marker,
+            recent_task_summary=recent_task_summary,
         )
 
         # Add to queue for sequential processing
@@ -382,13 +400,36 @@ class CanopusCore(commands.Cog, AgentAcknowledgmentMixin):
         # Track completed task for workflow continuity
         self.workflow_state_provider.on_task_completed(context.message_content)
 
+        # Whether this is a dispatched task that did real work
+        is_dispatched_with_work = (
+            is_from_agent and context.node_marker and response.tool_calls_made > 0
+        )
+
         # Check if response is just noise (acknowledgments, etc.)
+        # But never suppress noise for dispatched tasks that did real work —
+        # those MUST send a response to prevent node timeout
         if response.content and self._is_noise_response(response.content):
-            logger.info(
-                f"[Canopus] SUPPRESSING NOISE RESPONSE: msg_id={message.id}, "
-                f"content='{response.content[:50]}'"
+            if is_dispatched_with_work:
+                logger.info(
+                    f"[Canopus] KEEPING NOISE for dispatched task: msg_id={message.id}, "
+                    f"tool_calls={response.tool_calls_made}, content='{response.content[:50]}'"
+                )
+            else:
+                logger.info(
+                    f"[Canopus] SUPPRESSING NOISE RESPONSE: msg_id={message.id}, "
+                    f"content='{response.content[:50]}'"
+                )
+                response.content = ""  # Clear the noise
+
+        # Safety net: dispatched tasks must always have content
+        if is_dispatched_with_work and not response.content:
+            response.content = (
+                f"Web research completed ({response.tool_calls_made} operations performed). "
+                f"No detailed findings to report."
             )
-            response.content = ""  # Clear the noise
+            logger.info(
+                f"[Canopus] INJECTED FALLBACK for dispatched task: msg_id={message.id}"
+            )
 
         # Check if our response is stale (conversation moved on while we were processing)
         should_send = True
@@ -429,9 +470,13 @@ class CanopusCore(commands.Cog, AgentAcknowledgmentMixin):
         )
 
         # Send completion reaction for inter-agent messages
-        # This tells other agents we've finished processing
-        # Only mark done if we actually sent a response
-        if is_from_agent and response.content and should_send:
+        # Always send DONE for dispatched tasks to prevent timeout,
+        # even if content was marginal
+        should_react = (
+            (is_from_agent and response.content and should_send)
+            or is_dispatched_with_work
+        )
+        if should_react:
             try:
                 await message.add_reaction(REACTION_DONE)
                 logger.info(f"[Canopus] Sent ✔️ completion for message {message.id}")

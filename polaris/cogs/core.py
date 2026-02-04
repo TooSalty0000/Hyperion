@@ -373,6 +373,12 @@ class PolarisCore(commands.Cog, AgentAcknowledgmentMixin):
                 )
                 return
 
+        # Thinking layer: user message while task is active → route to running task
+        if not is_from_agent and self.message_queue.has_active_task_for_channel(message.channel.id):
+            logger.info(f"[Polaris] ADJUSTMENT routed to running task: '{clean_content[:50]}...'")
+            await message.add_reaction("\U0001f442")  # 👂
+            return
+
         # Extract node marker from dispatch content (if present)
         node_marker = None
         if is_from_agent:
@@ -414,6 +420,17 @@ class PolarisCore(commands.Cog, AgentAcknowledgmentMixin):
             guild_id=message.guild.id if message.guild else None,
         )
 
+        # Build recent task context for the LLM
+        recent_task_summary = None
+        recent = self.message_queue.get_recent_completion(message.channel.id)
+        if recent:
+            recent_task_summary = (
+                f"You recently completed a task in this channel ({recent.elapsed_seconds}s ago): "
+                f"{recent.content[:200]}"
+            )
+            if recent.tools_used:
+                recent_task_summary += f"\nTools used: {', '.join(recent.tools_used[-5:])}"
+
         # Create agent context
         context = AgentContext(
             channel_id=message.channel.id,
@@ -424,6 +441,7 @@ class PolarisCore(commands.Cog, AgentAcknowledgmentMixin):
             conversation_id=conversation_id,
             is_from_agent=is_from_agent,
             node_marker=node_marker,
+            recent_task_summary=recent_task_summary,
         )
 
         # Add to queue for sequential processing

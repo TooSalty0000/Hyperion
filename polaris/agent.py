@@ -618,6 +618,17 @@ When you learn scheduling preferences or recurring patterns, use store_memory to
                 Message(role=Role.USER, content=f"[{user_name}]: {context.message_content}")
             )
 
+        # Inject recent task context for continuity
+        if context.recent_task_summary:
+            messages.append(Message(
+                role=Role.SYSTEM,
+                content=(
+                    f"[RECENT WORK]\n{context.recent_task_summary}\n\n"
+                    "Consider whether this new message relates to your recent work. "
+                    "Reuse existing resources (sessions, browser tabs, etc.) when appropriate."
+                ),
+            ))
+
         return messages
 
     async def _fetch_discord_history(
