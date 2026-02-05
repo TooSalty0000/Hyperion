@@ -16,18 +16,23 @@ from shared.job_graph.models import JobNode, JobGraph, NodeType, NodeStatus
 logger = logging.getLogger(__name__)
 
 
-NODE_ITEM_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "id": {"type": "string", "description": "Short unique ID like 'n1', 'n2'"},
-        "type": {"type": "string", "enum": ["think", "dispatch", "respond"], "description": "Node type"},
-        "description": {"type": "string", "description": "What this node does"},
-        "agent": {"type": "string", "enum": ["altair", "polaris", "canopus"], "description": "Target agent (required for dispatch)"},
-        "dependencies": {"type": "array", "items": {"type": "string"}, "description": "Node IDs that must complete first"},
-        "timeout": {"type": "integer", "description": "Timeout in seconds (default 120)"},
-    },
-    "required": ["id", "type", "description"],
-}
+_DEFAULT_AGENT_NAMES = ["altair", "polaris", "canopus"]
+
+
+def _build_node_schema(agent_names: list[str]) -> dict:
+    """Build the node item schema with a dynamic agent enum."""
+    return {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "Short unique ID like 'n1', 'n2'"},
+            "type": {"type": "string", "enum": ["think", "dispatch", "respond"], "description": "Node type"},
+            "description": {"type": "string", "description": "What this node does"},
+            "agent": {"type": "string", "enum": agent_names, "description": "Target agent (required for dispatch)"},
+            "dependencies": {"type": "array", "items": {"type": "string"}, "description": "Node IDs that must complete first"},
+            "timeout": {"type": "integer", "description": "Timeout in seconds (default 120)"},
+        },
+        "required": ["id", "type", "description"],
+    }
 
 
 class CreatePlanTool(Tool):
@@ -39,18 +44,22 @@ class CreatePlanTool(Tool):
     You can add more nodes later if the task becomes complex.
     """
 
+    def __init__(self, agent_names: list[str] | None = None):
+        self._agent_names = agent_names or _DEFAULT_AGENT_NAMES
+        self._node_schema = _build_node_schema(self._agent_names)
+
     @property
     def name(self) -> str:
         return "create_plan"
 
     @property
     def description(self) -> str:
+        agents_str = ", ".join(self._agent_names)
         return (
             "Create a new execution plan as a DAG (directed acyclic graph) of tasks. "
             "Each node represents a unit of work: 'think' (reason internally), "
             "'dispatch' (send task to an agent), or 'respond' (reply to user). "
-            "Nodes can depend on other nodes. Available agents: altair (CLI/code), "
-            "polaris (calendar), canopus (web browser). "
+            f"Nodes can depend on other nodes. Available agents: {agents_str}. "
             "Set appropriate timeouts per node (30s for quick checks, 300s for builds)."
         )
 
@@ -68,7 +77,7 @@ class CreatePlanTool(Tool):
                 type="array",
                 description="List of job nodes for the plan",
                 required=True,
-                items=NODE_ITEM_SCHEMA,
+                items=self._node_schema,
             ),
             ToolParameter(
                 name="project",
@@ -89,7 +98,7 @@ class CreatePlanTool(Tool):
 
         trigger_message = context.trigger_message
         if not trigger_message:
-            return "Error: No trigger message available for thread creation."
+            return "Error: No trigger message available for graph creation."
 
         # Validate nodes are dicts before creating the graph/thread
         if not nodes or not isinstance(nodes[0], dict):
@@ -171,23 +180,16 @@ class CreatePlanTool(Tool):
             error_str = "; ".join(errors)
             return f"Plan created with {len(graph.nodes)} nodes. Errors: {error_str}"
 
-        # Create meeting room if any DISPATCH nodes exist (skip if department already assigned)
-        has_dispatch = any(
-            n.type == NodeType.DISPATCH for n in graph.nodes.values()
-        )
-        if has_dispatch and not department_assigned:
-            project_channel_id = await executor.create_project_channel(graph)
-            if project_channel_id and trigger_message:
-                try:
-                    await trigger_message.channel.send(
-                        f"Created meeting room <#{project_channel_id}> for this plan.",
-                        silent=True,
-                    )
-                except discord.HTTPException:
-                    pass
-
-        # Post the plan embed to the thread
-        await executor._post_plan_embed(graph)
+        # Auto-fix: respond nodes with no dependencies should run last
+        for node in graph.nodes.values():
+            if node.type == NodeType.RESPOND and not node.dependencies:
+                work_ids = [
+                    n.id for n in graph.nodes.values()
+                    if n.type in (NodeType.DISPATCH, NodeType.THINK)
+                ]
+                if work_ids:
+                    node.dependencies = work_ids
+                    node.status = NodeStatus.PENDING
 
         # Dispatch any immediately ready nodes
         dispatched = await executor.dispatch_ready_nodes(graph)
@@ -200,10 +202,27 @@ class CreatePlanTool(Tool):
         ready_count = len(graph.get_ready_nodes())
         dispatch_str = f", {len(dispatched)} dispatched" if dispatched else ""
 
-        return (
+        result_str = (
             f"Plan created: {len(graph.nodes)} nodes{dispatch_str}, "
             f"{ready_count} ready. Graph ID: {graph.id}"
         )
+
+        # Warn the LLM if active graphs already existed (should have used add_nodes)
+        existing_active = [
+            g for g in executor.get_active_graphs(trigger_message.channel.id)
+            if g.id != graph.id
+        ]
+        if existing_active:
+            existing_ids = ", ".join(g.id for g in existing_active)
+            warning = (
+                f"WARNING: {len(existing_active)} active graph(s) already exist in this channel "
+                f"(IDs: {existing_ids}). You should usually use `add_nodes` to extend an existing "
+                f"graph instead of creating a new one. Only create new plans for COMPLETELY "
+                f"unrelated tasks. "
+            )
+            return warning + result_str
+
+        return result_str
 
 
 class AddNodesTool(Tool):
@@ -213,6 +232,10 @@ class AddNodesTool(Tool):
     Use this when you realize more work is needed during execution.
     New nodes can depend on existing nodes (completed or pending).
     """
+
+    def __init__(self, agent_names: list[str] | None = None):
+        self._agent_names = agent_names or _DEFAULT_AGENT_NAMES
+        self._node_schema = _build_node_schema(self._agent_names)
 
     @property
     def name(self) -> str:
@@ -239,7 +262,7 @@ class AddNodesTool(Tool):
                 type="array",
                 description="List of new nodes to add (same format as create_plan)",
                 required=True,
-                items=NODE_ITEM_SCHEMA,
+                items=self._node_schema,
             ),
         ]
 
@@ -279,15 +302,16 @@ class AddNodesTool(Tool):
             except (ValueError, KeyError) as e:
                 logger.warning(f"Failed to add node: {e}")
 
-        # Lazily create meeting room if first DISPATCH nodes were just added
-        if not graph.project_channel_id:
-            has_new_dispatch = any(
-                isinstance(nd, dict)
-                and NodeType(nd.get("type", "think")) == NodeType.DISPATCH
-                for nd in nodes
-            )
-            if has_new_dispatch:
-                await executor.create_project_channel(graph)
+        # Auto-fix: respond nodes with no dependencies should run last
+        for node in graph.nodes.values():
+            if node.type == NodeType.RESPOND and not node.dependencies:
+                work_ids = [
+                    n.id for n in graph.nodes.values()
+                    if n.type in (NodeType.DISPATCH, NodeType.THINK)
+                ]
+                if work_ids:
+                    node.dependencies = work_ids
+                    node.status = NodeStatus.PENDING
 
         # Dispatch newly ready nodes
         dispatched = await executor.dispatch_ready_nodes(graph)
@@ -398,9 +422,6 @@ class UpdateNodeTool(Tool):
         has_agent_dispatch = any(n.type == NodeType.DISPATCH for n in all_dispatched)
         if has_agent_dispatch:
             context.dispatched_to_agents = True
-
-        # Post node update embed to thread
-        await executor._post_node_update_embed(graph, node, status, result)
 
         # Check if graph is done
         if graph.is_goal_met():
@@ -564,11 +585,16 @@ class RespondToUserTool(Tool):
         return f"Response queued for delivery to user ({len(message)} chars)."
 
 
-def get_graph_tools() -> list[Tool]:
-    """Get all graph management tools."""
+def get_graph_tools(agent_names: list[str] | None = None) -> list[Tool]:
+    """Get all graph management tools.
+
+    Args:
+        agent_names: List of available agent names for dispatch nodes.
+            Defaults to ["altair", "polaris", "canopus"] if None.
+    """
     return [
-        CreatePlanTool(),
-        AddNodesTool(),
+        CreatePlanTool(agent_names),
+        AddNodesTool(agent_names),
         UpdateNodeTool(),
         CancelNodesTool(),
         RespondToUserTool(),

@@ -351,27 +351,14 @@ class PolarisCore(commands.Cog, AgentAcknowledgmentMixin):
             )
             return
 
-        # Pre-enqueue check: Should we respond at all?
+        # Pre-enqueue check: Log conversational agent mentions (but don't block)
         if is_from_agent:
-            # Check if this is a genuine task dispatch (mention at start)
-            # vs. casual mention in another agent's conversational response.
-            # Real dispatches from the job graph executor always start with
-            # our @mention. Conversational messages embed mentions mid-text.
-            if not self._is_agent_dispatch(message):
+            has_node_marker = parse_node_marker(clean_content) is not None
+            if not has_node_marker and not self._is_agent_dispatch(message):
                 logger.info(
-                    f"[Polaris] SKIPPING casual agent mention: '{clean_content[:50]}...' - "
-                    f"not a direct dispatch (mention not at start of message)"
+                    f"[Polaris] Conversational agent mention (no node marker): "
+                    f"'{clean_content[:50]}...' - passing to LLM for decision"
                 )
-                return
-        else:
-            # Check for casual mentions from users that don't need a response
-            should_respond = await self._should_respond_to_mention(message, clean_content)
-            if not should_respond:
-                logger.info(
-                    f"[Polaris] SKIPPING casual mention: '{clean_content[:50]}...' - "
-                    f"utility LLM decided no response needed"
-                )
-                return
 
         # Thinking layer: user message while task is active → route to running task
         if not is_from_agent and self.message_queue.has_active_task_for_channel(message.channel.id):
@@ -646,95 +633,6 @@ class PolarisCore(commands.Cog, AgentAcknowledgmentMixin):
             return True
 
         return False
-
-    async def _should_respond_to_mention(
-        self,
-        message: discord.Message,
-        clean_content: str,
-    ) -> bool:
-        """
-        Use utility LLM to quickly decide if we should respond to this mention.
-
-        Returns False for casual mentions, greetings, or when we're just being
-        discussed rather than asked to do something.
-        """
-        # Quick pattern checks for obvious cases (save LLM call)
-        content_lower = clean_content.lower().strip()
-
-        # Always respond to calendar or todo-related queries
-        if any(word in content_lower for word in [
-            "calendar", "schedule", "event", "meeting", "appointment",
-            "when", "what time", "free", "busy", "book", "cancel",
-            "reschedule", "remind", "today", "tomorrow", "week",
-            "todo", "to-do", "task", "due", "complete", "done",
-            "reminder", "overdue", "priority",
-        ]):
-            return True
-
-        # Check if utility LLM is available
-        if not self.agent or not self.agent.utility_llm:
-            # No utility LLM, default to responding
-            return True
-
-        # Gather recent context
-        recent_context = []
-        try:
-            async for msg in message.channel.history(limit=5, before=message):
-                if msg.content:
-                    author = msg.author.display_name
-                    recent_context.append(f"[{author}]: {msg.content[:100]}")
-            recent_context.reverse()
-        except Exception:
-            pass
-
-        context_str = "\n".join(recent_context[-3:]) if recent_context else "(no recent messages)"
-
-        # Quick LLM evaluation
-        from shared.llm.types import Message, Role
-        prompt = f"""You are deciding whether an AI agent named Polaris should respond to a Discord message.
-
-Polaris is a calendar/scheduling specialist. She should ONLY respond when:
-- Someone is asking about calendar, scheduling, meetings, or events
-- Someone is asking her a direct question
-- She is being assigned a task related to time management
-
-Polaris should NOT respond when:
-- People are just chatting casually and happened to mention her
-- It's a general greeting to everyone (like "hi everyone" or "hello team")
-- Others are discussing her but not talking TO her
-- Another agent already handled the request
-- It's just social pleasantries or acknowledgments
-
-Recent conversation:
-{context_str}
-
-Message that mentioned Polaris:
-[{message.author.display_name}]: {clean_content}
-
-Should Polaris respond to this message? Answer only YES or NO."""
-
-        try:
-            response = await self.agent.utility_llm.generate(
-                messages=[Message(role=Role.USER, content=prompt)],
-                temperature=0.0,
-                max_tokens=10,
-            )
-
-            answer = response.content.strip().upper() if response.content else "YES"
-            should_respond = "YES" in answer
-
-            if not should_respond:
-                logger.info(
-                    f"[Polaris] Utility LLM says NO RESPONSE needed for: "
-                    f"'{clean_content[:40]}...'"
-                )
-
-            return should_respond
-
-        except Exception as e:
-            logger.warning(f"[Polaris] Utility LLM check failed: {e}")
-            # On error, default to responding
-            return True
 
     def _is_noise_response(self, content: str) -> bool:
         """

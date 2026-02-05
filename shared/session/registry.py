@@ -13,6 +13,21 @@ from .models import ActiveSession
 logger = logging.getLogger(__name__)
 
 
+def _process_name_to_mode(process_name: Optional[str]) -> Optional[str]:
+    """Map a foreground process name to a session mode.
+
+    Returns "claude_code", "shell", or None (unknown — don't change mode).
+    """
+    if not process_name:
+        return None
+    name = process_name.lower().strip()
+    if "claude" in name:
+        return "claude_code"
+    if name in ("bash", "zsh", "sh", "fish", "dash", "ksh", "tcsh", "csh"):
+        return "shell"
+    return None  # Unknown process — don't change mode
+
+
 @dataclass
 class SessionDefaults:
     """Default configuration for session creation."""
@@ -207,6 +222,19 @@ class SessionRegistry:
         """Get next available session ID."""
         return await self._store.get_next_id()
 
+    async def update_mode(self, session_id: int, mode: str) -> bool:
+        """Update the mode ('shell' or 'claude_code') for a session."""
+        session = self._sessions.get(session_id)
+        if not session:
+            return False
+        old_mode = getattr(session.data, 'mode', 'shell')
+        if old_mode == mode:
+            return True
+        session.data.mode = mode
+        await self._store.update(session_id, mode=mode)
+        logger.info(f"Session {session_id} mode changed: {old_mode} -> {mode}")
+        return True
+
     async def recover_sessions(self, start_output_loop_callback=None) -> List[ActiveSession]:
         """
         Recover sessions from persistent store on startup.
@@ -294,6 +322,13 @@ class SessionRegistry:
                 self._sessions[session_data.session_id] = active_session
                 if session_data.channel_id:
                     self._channel_map[session_data.channel_id] = session_data.session_id
+
+                # Reconcile mode with live foreground process
+                detected = _process_name_to_mode(terminal.get_foreground_process())
+                if detected and detected != getattr(session_data, 'mode', 'shell'):
+                    session_data.mode = detected
+                    await self._store.update(session_data.session_id, mode=detected)
+                    logger.info(f"Session {session_data.session_id} mode reconciled to {detected}")
 
                 # Start output loop if callback provided
                 if start_output_loop_callback:

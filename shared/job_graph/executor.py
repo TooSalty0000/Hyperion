@@ -15,13 +15,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Embed colors
-COLOR_PLAN = 0x5865F2      # Blurple - plan created
-COLOR_DISPATCH = 0xFEE75C  # Yellow - node dispatched
-COLOR_COMPLETE = 0x57F287  # Green - node/graph completed
-COLOR_FAILED = 0xED4245    # Red - node/graph failed
-COLOR_TIMEOUT = 0xE67E22   # Orange - timeout
-COLOR_STATUS = 0x99AAB5    # Grey - status update
+# Embed color for meeting room intro
+COLOR_PLAN = 0x5865F2      # Blurple
 
 
 class JobGraphExecutor:
@@ -30,7 +25,6 @@ class JobGraphExecutor:
 
     Responsibilities:
     - Track all active graphs across channels
-    - Create Discord threads for planning visibility
     - Dispatch READY nodes by sending @mentions
     - Handle timeouts on running nodes
     - Provide graph state context for Vega's LLM
@@ -50,9 +44,6 @@ class JobGraphExecutor:
 
         # Active graphs: channel_id → list of graphs (multiple can be active)
         self._graphs: dict[int, list[JobGraph]] = {}
-
-        # Thread ID → graph mapping for quick lookup
-        self._thread_to_graph: dict[int, JobGraph] = {}
 
         # Project channel (meeting room / department) → list of graphs (1:many for departments)
         self._project_channel_to_graphs: dict[int, list[JobGraph]] = {}
@@ -79,17 +70,13 @@ class JobGraphExecutor:
             result.extend(g for g in graphs if g.status == GraphStatus.ACTIVE)
         return result
 
-    def get_graph_by_thread(self, thread_id: int) -> Optional[JobGraph]:
-        """Get a graph by its thread ID."""
-        return self._thread_to_graph.get(thread_id)
-
     async def create_graph(
         self,
         goal: str,
         trigger_message: discord.Message,
     ) -> JobGraph:
         """
-        Create a new job graph and its Discord thread.
+        Create a new job graph.
 
         Args:
             goal: The user's goal/request
@@ -104,18 +91,6 @@ class JobGraphExecutor:
             channel_id=trigger_message.channel.id,
             max_timeout=self.max_timeout,
         )
-
-        # Create a Discord thread under the user's message for planning visibility
-        try:
-            thread = await trigger_message.create_thread(
-                name=f"Plan: {goal[:80]}",
-                auto_archive_duration=60,
-            )
-            graph.thread_id = thread.id
-            self._thread_to_graph[thread.id] = graph
-            logger.info(f"[Executor] Created thread {thread.id} for graph {graph.id}")
-        except discord.HTTPException as e:
-            logger.warning(f"[Executor] Failed to create thread: {e}")
 
         # Track the graph
         channel_id = trigger_message.channel.id
@@ -133,8 +108,8 @@ class JobGraphExecutor:
         Sequential-per-agent: only one DISPATCH node per agent may be RUNNING
         at a time (across all active graphs).  Additional READY nodes for a
         busy agent are deferred until the running node completes or fails.
-        For THINK nodes: marks as running (Vega handles internally).
-        For RESPOND nodes: marks as running (Vega handles internally).
+        For THINK nodes: auto-completes (reasoning already done during planning).
+        For RESPOND nodes: marks as running (Vega handles via respond_to_user).
 
         Returns:
             List of nodes that were dispatched
@@ -157,14 +132,14 @@ class JobGraphExecutor:
                 if success:
                     dispatched.append(node)
                     busy_agents.add(node.agent)
-            elif node.type in (NodeType.THINK, NodeType.RESPOND):
-                # These are handled by Vega's LLM directly
+            elif node.type == NodeType.THINK:
+                # Think = Vega's internal reasoning, already done when plan was created.
+                # Auto-complete to unblock dependent dispatch nodes.
+                graph.mark_completed(node.id, "Internal reasoning completed")
+                dispatched.append(node)
+            elif node.type == NodeType.RESPOND:
                 graph.mark_running(node.id)
                 dispatched.append(node)
-
-        # Update thread with dispatch status
-        if dispatched and graph.thread_id:
-            await self._post_status_embed(graph)
 
         return dispatched
 
@@ -204,9 +179,6 @@ class JobGraphExecutor:
 
             # Schedule per-node timeout
             self._schedule_timeout(graph, node)
-
-            # Post dispatch embed to thread
-            await self._post_dispatch_embed(graph, node)
             return True
         except discord.HTTPException as e:
             logger.error(f"[Executor] Failed to dispatch node {node.id}: {e}")
@@ -252,11 +224,6 @@ class JobGraphExecutor:
                     f"[Executor] Node '{node.id}' timed out in graph '{graph.id}' "
                     f"(agent={node.agent}, timeout={node.timeout}s)"
                 )
-                # Post timeout embed
-                try:
-                    await self._post_timeout_embed(graph, node)
-                except Exception as embed_err:
-                    logger.error(f"[Executor] Failed to post timeout embed: {embed_err}")
                 # Fire callback (Vega re-evaluation)
                 if self._on_timeout_callback:
                     try:
@@ -352,8 +319,6 @@ class JobGraphExecutor:
                     if node.type == NodeType.DISPATCH and node.agent == agent_name:
                         success = await self._dispatch_to_agent(graph, node)
                         if success:
-                            if graph.thread_id:
-                                await self._post_status_embed(graph)
                             return [node]
         return []
 
@@ -456,19 +421,27 @@ class JobGraphExecutor:
         Get context string for active graphs in a specific channel.
 
         This helps Vega decide whether to extend an existing graph or create new.
+        Includes agent availability so Vega can plan around busy agents.
         """
         active = self.get_active_graphs(channel_id)
         if not active:
             return "ACTIVE JOB GRAPHS: None in this channel. You may create a new plan."
 
         lines = ["ACTIVE JOB GRAPHS (this channel):"]
-        lines.append(">>> If the user's message relates to these graphs, use `add_nodes` to extend them.")
-        lines.append(">>> Only use `create_plan` for completely unrelated tasks.")
+        lines.append(">>> IMPORTANT: Use `add_nodes` to extend these graphs. Do NOT create a new plan unless the task is COMPLETELY unrelated.")
+        lines.append(">>> For simple follow-ups, just call `respond_to_user` with the graph_id.")
         lines.append("")
 
         for graph in active:
             lines.append(graph.get_context_for_llm())
             lines.append("")
+
+        # Show agent availability so Vega can plan around busy agents
+        busy_agents = self._get_running_dispatch_agents()
+        if busy_agents:
+            lines.append(f"BUSY AGENTS: {', '.join(sorted(busy_agents))} (dispatches to these agents will be queued)")
+        else:
+            lines.append("ALL AGENTS AVAILABLE")
 
         return "\n".join(lines)
 
@@ -491,15 +464,11 @@ class JobGraphExecutor:
         return "\n".join(lines)
 
     async def complete_graph(self, graph: JobGraph) -> None:
-        """Mark a graph as completed. Delete thread and meeting room (but not departments)."""
+        """Mark a graph as completed. Delete meeting room (but not departments)."""
         graph.status = GraphStatus.COMPLETED
 
         # Cancel any remaining timeout tasks for this graph
         self.cancel_all_timeouts(graph.id)
-
-        # Post completion embed then delete the thread
-        await self._post_completion_embed(graph, success=True)
-        await self._delete_thread(graph)
 
         # Only delete channel if it's NOT a department
         if graph.project_channel_id and graph.project_channel_id not in self._department_channel_ids:
@@ -508,30 +477,18 @@ class JobGraphExecutor:
             # Remove graph from the channel's graph list but keep the channel
             self._remove_graph_from_channel(graph)
 
-        # Clean up thread mapping
-        if graph.thread_id and graph.thread_id in self._thread_to_graph:
-            del self._thread_to_graph[graph.thread_id]
-
     async def fail_graph(self, graph: JobGraph) -> None:
-        """Mark a graph as failed. Delete thread and meeting room (but not departments)."""
+        """Mark a graph as failed. Delete meeting room (but not departments)."""
         graph.status = GraphStatus.FAILED
 
         # Cancel any remaining timeout tasks for this graph
         self.cancel_all_timeouts(graph.id)
-
-        # Post failure embed then delete the thread
-        await self._post_completion_embed(graph, success=False)
-        await self._delete_thread(graph)
 
         # Only delete channel if it's NOT a department
         if graph.project_channel_id and graph.project_channel_id not in self._department_channel_ids:
             await self._delete_project_channel(graph)
         elif graph.project_channel_id and graph.project_channel_id in self._department_channel_ids:
             self._remove_graph_from_channel(graph)
-
-        # Clean up thread mapping
-        if graph.thread_id and graph.thread_id in self._thread_to_graph:
-            del self._thread_to_graph[graph.thread_id]
 
     def _remove_graph_from_channel(self, graph: JobGraph) -> None:
         """Remove a graph from a project channel's graph list."""
@@ -659,170 +616,6 @@ class JobGraphExecutor:
         """Get mapping of department channel IDs to project names."""
         return dict(self._department_info)
 
-    # --------------------------------------------------
-    # EMBED HELPERS
-    # --------------------------------------------------
-
-    async def _post_plan_embed(self, graph: JobGraph) -> None:
-        """Post the initial plan creation embed to the thread."""
-        if not graph.thread_id:
-            return
-
-        embed = discord.Embed(
-            title="Plan Created",
-            description=f"**Goal:** {graph.goal}",
-            color=COLOR_PLAN,
-        )
-
-        # List nodes
-        node_lines = []
-        for node in graph.nodes.values():
-            node_lines.append(node.to_summary())
-
-        if node_lines:
-            embed.add_field(
-                name=f"Tasks ({len(node_lines)})",
-                value="\n".join(node_lines),
-                inline=False,
-            )
-
-        embed.set_footer(text=f"Graph: {graph.id}")
-
-        await self._send_to_thread(graph, embed=embed)
-
-    async def _post_status_embed(self, graph: JobGraph) -> None:
-        """Post a status update embed."""
-        if not graph.thread_id:
-            return
-
-        embed = discord.Embed(
-            color=COLOR_STATUS,
-        )
-
-        node_lines = []
-        for node in graph.nodes.values():
-            node_lines.append(node.to_summary())
-
-        if node_lines:
-            embed.description = "\n".join(node_lines)
-
-        # Status counts in footer
-        counts = {}
-        for node in graph.nodes.values():
-            counts[node.status.value] = counts.get(node.status.value, 0) + 1
-        status_str = " | ".join(f"{k}: {v}" for k, v in sorted(counts.items()))
-        embed.set_footer(text=status_str)
-
-        await self._send_to_thread(graph, embed=embed)
-
-    async def _post_dispatch_embed(self, graph: JobGraph, node: JobNode) -> None:
-        """Post a dispatch notification embed."""
-        if not graph.thread_id:
-            return
-
-        embed = discord.Embed(
-            description=f"**{node.agent}** ← `{node.id}`: {node.description}",
-            color=COLOR_DISPATCH,
-        )
-        embed.set_footer(text=f"Timeout: {node.timeout}s")
-
-        await self._send_to_thread(graph, embed=embed)
-
-    async def _post_node_update_embed(
-        self, graph: JobGraph, node: JobNode, status: str, detail: str = ""
-    ) -> None:
-        """Post a node status change embed."""
-        if not graph.thread_id:
-            return
-
-        if status == "completed":
-            color = COLOR_COMPLETE
-        elif status == "failed":
-            color = COLOR_FAILED
-        else:
-            color = COLOR_STATUS
-
-        desc = f"`{node.id}` → **{status}**"
-        if detail:
-            desc += f"\n{detail[:200]}"
-
-        embed = discord.Embed(description=desc, color=color)
-        await self._send_to_thread(graph, embed=embed)
-
-    async def _post_completion_embed(self, graph: JobGraph, success: bool) -> None:
-        """Post the final graph completion embed."""
-        if not graph.thread_id:
-            return
-
-        if success:
-            embed = discord.Embed(
-                title="Plan Complete",
-                description=f"Goal achieved: {graph.goal}",
-                color=COLOR_COMPLETE,
-            )
-        else:
-            embed = discord.Embed(
-                title="Plan Failed",
-                description=f"Goal: {graph.goal}",
-                color=COLOR_FAILED,
-            )
-
-        # Summarize node outcomes
-        completed = sum(1 for n in graph.nodes.values() if n.status == NodeStatus.COMPLETED)
-        failed = sum(1 for n in graph.nodes.values() if n.status == NodeStatus.FAILED)
-        cancelled = sum(1 for n in graph.nodes.values() if n.status == NodeStatus.CANCELLED)
-
-        summary = f"{completed} completed"
-        if failed:
-            summary += f", {failed} failed"
-        if cancelled:
-            summary += f", {cancelled} cancelled"
-        embed.set_footer(text=summary)
-
-        await self._send_to_thread(graph, embed=embed)
-
-    async def _post_timeout_embed(self, graph: JobGraph, node: JobNode) -> None:
-        """Post a timeout notification embed."""
-        if not graph.thread_id:
-            return
-
-        embed = discord.Embed(
-            description=f"`{node.id}` ({node.agent}) timed out after **{node.timeout}s**",
-            color=COLOR_TIMEOUT,
-        )
-        await self._send_to_thread(graph, embed=embed)
-
-    # --------------------------------------------------
-    # THREAD MANAGEMENT
-    # --------------------------------------------------
-
-    async def _send_to_thread(
-        self, graph: JobGraph, content: str = None, embed: discord.Embed = None
-    ) -> None:
-        """Send a message or embed to a graph's planning thread."""
-        if not graph.thread_id:
-            return
-
-        try:
-            thread = self.bot.get_channel(graph.thread_id)
-            if thread:
-                await thread.send(content=content, embed=embed, silent=True)
-        except discord.HTTPException as e:
-            logger.warning(f"[Executor] Failed to send to thread: {e}")
-
-    async def _delete_thread(self, graph: JobGraph) -> None:
-        """Delete a graph's planning thread."""
-        if not graph.thread_id:
-            return
-
-        try:
-            thread = self.bot.get_channel(graph.thread_id)
-            if thread:
-                await thread.delete()
-                logger.info(f"[Executor] Deleted thread {graph.thread_id} for graph {graph.id}")
-        except discord.HTTPException as e:
-            logger.warning(f"[Executor] Failed to delete thread: {e}")
-
     async def _delete_project_channel(self, graph: JobGraph) -> None:
         """Delete a graph's meeting room channel."""
         if not graph.project_channel_id:
@@ -850,20 +643,6 @@ class JobGraphExecutor:
             if not self._project_channel_to_graphs[graph.project_channel_id]:
                 del self._project_channel_to_graphs[graph.project_channel_id]
 
-    async def post_to_thread(self, graph: JobGraph, message: str) -> None:
-        """Post a plain text message to a graph's planning thread (legacy compat)."""
-        if not graph.thread_id:
-            return
-
-        try:
-            thread = self.bot.get_channel(graph.thread_id)
-            if thread:
-                if len(message) > 1900:
-                    message = message[:1900] + "..."
-                await thread.send(message, silent=True)
-        except discord.HTTPException as e:
-            logger.warning(f"[Executor] Failed to post to thread: {e}")
-
     # --------------------------------------------------
     # CLEANUP
     # --------------------------------------------------
@@ -883,8 +662,6 @@ class JobGraphExecutor:
             remaining = []
             for graph in self._graphs[channel_id]:
                 if graph.status != GraphStatus.ACTIVE and graph.created_at < cutoff:
-                    if graph.thread_id and graph.thread_id in self._thread_to_graph:
-                        del self._thread_to_graph[graph.thread_id]
                     # Clean up project channel mapping (but not department keys)
                     if graph.project_channel_id and graph.project_channel_id in self._project_channel_to_graphs:
                         pc_graphs = self._project_channel_to_graphs[graph.project_channel_id]

@@ -161,6 +161,7 @@ class CreateSessionTool(Tool):
                     claude_cmd += " --continue"
 
                 await session.terminal.send_input(claude_cmd + "\n")
+                await context.session_registry.update_mode(session.session_id, "claude_code")
                 result_parts.append(f"Claude Code: Started ({'continuing' if continue_claude_session else 'fresh session'})")
 
             return "\n".join(result_parts)

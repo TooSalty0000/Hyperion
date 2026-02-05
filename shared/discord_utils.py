@@ -289,11 +289,14 @@ async def convert_text_mentions_to_discord(
     if not matches:
         return content
 
-    # Process matches in reverse order to preserve string positions
-    result = content
-    for match in reversed(matches):
+    # Deduplicate: resolve each unique name once, then replace all occurrences
+    unique_names: dict[str, tuple[str, int | None, str | None]] = {}
+    for match in matches:
         name = match.group(1)
         name_lower = name.lower()
+        if name_lower in unique_names:
+            continue
+
         user_id = None
         source = None
 
@@ -309,10 +312,8 @@ async def convert_text_mentions_to_discord(
 
         # 3. Try live guild member search (updates cache)
         if not user_id and guild:
-            # Search by name
             member = guild.get_member_named(name)
             if not member:
-                # Try case-insensitive search
                 for m in guild.members:
                     if m.display_name.lower() == name_lower or m.name.lower() == name_lower:
                         member = m
@@ -321,7 +322,6 @@ async def convert_text_mentions_to_discord(
             if member:
                 user_id = member.id
                 source = "guild"
-                # Update cache for next time
                 cache.add_member(member)
 
         # 4. Try fetching by query (last resort - API call)
@@ -337,11 +337,25 @@ async def convert_text_mentions_to_discord(
             except Exception as e:
                 logger.debug(f"[MentionConvert] query_members failed: {e}")
 
-        # Replace if found
-        if user_id:
-            logger.info(f"[MentionConvert] ✓ @{name} -> <@{user_id}> ({source})")
-            result = result[:match.start()] + f"<@{user_id}>" + result[match.end():]
-        else:
-            logger.warning(f"[MentionConvert] ✗ @{name} not found")
+        unique_names[name_lower] = (name, user_id, source)
+
+    # Log resolved names once (summary)
+    resolved = {n: (uid, src) for n, (_, uid, src) in unique_names.items() if uid}
+    unresolved = [n for n, (_, uid, _) in unique_names.items() if not uid]
+    if resolved:
+        parts = [f"@{n}->{src}" for n, (uid, src) in resolved.items()]
+        logger.info(f"[MentionConvert] Resolved {len(matches)} mentions ({len(resolved)} unique): {', '.join(parts)}")
+    if unresolved:
+        logger.warning(f"[MentionConvert] Unresolved: {', '.join('@' + n for n in unresolved)}")
+
+    # Apply replacements in reverse order to preserve positions
+    result = content
+    for match in reversed(matches):
+        name = match.group(1)
+        entry = unique_names.get(name.lower())
+        if entry:
+            _, user_id, _ = entry
+            if user_id:
+                result = result[:match.start()] + f"<@{user_id}>" + result[match.end():]
 
     return result

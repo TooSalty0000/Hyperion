@@ -25,6 +25,7 @@ class SessionData:
     command: Optional[str] = None
     project_name: Optional[str] = None  # Associated project name for session lookup
     notes: Optional[str] = None  # Altair's notes about what this session is for
+    mode: str = "shell"  # "shell" or "claude_code" — tracks foreground process type
 
 
 class SessionStore(ABC):

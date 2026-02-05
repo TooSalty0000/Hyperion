@@ -111,6 +111,22 @@ HOW TO USE CLAUDE CODE:
    - Use answer_terminal_prompt("yes") to approve, or "no" to reject
 7. Use get_cli_output to see detailed output when needed
 
+SESSION MODES (CRITICAL):
+Every session runs in one of two modes:
+- **Shell mode**: The terminal is at a bash/zsh prompt. send_cli_command sends shell commands.
+- **Claude Code mode**: Claude Code is the foreground process. send_cli_command sends natural language instructions to Claude Code.
+
+Tools like get_session_status, list_active_sessions, and monitor_session report the current mode.
+
+WHEN YOU NEED SHELL COMMANDS AND CLAUDE CODE IS ACTIVE:
+If a session is in Claude Code mode and you need to run shell commands (git, ls, npm, etc.):
+1. **Option A — Exit CC first**: Use exit_claude_code to return to shell, run your commands, then optionally use start_claude_code to re-enter CC.
+2. **Option B — Separate session**: Use create_session to create a dedicated shell session for CLI commands. This is better when CC has an ongoing conversation you don't want to interrupt.
+
+For READ-ONLY filesystem operations (reading files, listing directories, finding files), use the navigation tools (list_directory, read_file, find_files, file_info) instead — these work regardless of session mode and don't require a terminal.
+
+NEVER send raw shell commands (git, ls, npm, make, etc.) to a Claude Code session via send_cli_command. The tool will block this and tell you to exit CC first or use a separate session.
+
 MONITORING WORKFLOW (CRITICAL):
 - DON'T just wait passively - actively monitor and REPORT to the user!
 - Use monitor_session every 10-30 seconds while work is in progress
@@ -226,12 +242,17 @@ Sometimes the best response is NO response. Do NOT reply when:
 - Someone is asking another agent a question (not you)
 - Someone is giving you INSTRUCTIONS or GUIDELINES (not a task)
 - Vega is telling agents what to do/not do - that's a directive, not a task
+- A message from another agent WITHOUT a [node:graph_id:node_id] dispatch marker
+  (These are conversational mentions — the agent is talking ABOUT you, not TO you)
+- Messages where you're mentioned as part of a status update, report, or narrative
 
 If you're uncertain whether to reply, consider:
 1. Was I directly asked to DO something specific with a concrete deliverable?
 2. Does this require my CLI/project expertise to produce something?
 3. Has someone else already addressed this?
 4. Would my response add VALUE or just add NOISE?
+5. Does this message have a dispatch marker [node:*:*]? If YES, it's a real task.
+   If NO and it's from another agent, it's almost certainly conversational — stay silent.
 
 === HOW TO NOT REPLY (THIS IS CRUCIAL) ===
 When you decide NOT to reply, you must produce LITERALLY EMPTY OUTPUT.
@@ -386,6 +407,7 @@ class AltairAgent(BaseAgent):
         # Import from altair's own tools module
         from altair.tools.cli_commands import (
             StartClaudeCodeTool,
+            ExitClaudeCodeTool,
             SendCLICommandTool,
             GetCLIOutputTool,
             WaitForCompletionTool,
@@ -433,6 +455,7 @@ class AltairAgent(BaseAgent):
 
         # CLI tools
         self._tools.register(StartClaudeCodeTool())
+        self._tools.register(ExitClaudeCodeTool())
         self._tools.register(SendCLICommandTool())
         self._tools.register(GetCLIOutputTool())
         self._tools.register(WaitForCompletionTool())
@@ -834,18 +857,34 @@ When you need to recall past information, check your active context above or use
 
         # Frame the current message based on source
         if context.is_from_agent:
-            # Dispatch from Vega — frame as authoritative directive
-            messages.append(
-                Message(
-                    role=Role.USER,
-                    content=(
-                        f"[DISPATCH FROM VEGA - THIS IS YOUR TASK]:\n"
-                        f"{context.message_content}\n\n"
-                        f"Do EXACTLY this task. The chat history above is for context only. "
-                        f"Do not infer additional work beyond what is stated here."
-                    ),
+            if context.node_marker:
+                # Real dispatch with node marker — authoritative task
+                messages.append(
+                    Message(
+                        role=Role.USER,
+                        content=(
+                            f"[DISPATCH FROM VEGA - THIS IS YOUR TASK]:\n"
+                            f"{context.message_content}\n\n"
+                            f"Do EXACTLY this task. The chat history above is for context only. "
+                            f"Do not infer additional work beyond what is stated here."
+                        ),
+                    )
                 )
-            )
+            else:
+                # Agent mention without dispatch marker — likely conversational
+                messages.append(
+                    Message(
+                        role=Role.USER,
+                        content=(
+                            f"[AGENT MESSAGE - EVALUATE BEFORE RESPONDING]:\n"
+                            f"{context.message_content}\n\n"
+                            f"This message is from another agent but has NO dispatch marker. "
+                            f"It is likely a conversational mention, not a task assigned to you. "
+                            f"Only respond if there is a clear, actionable request directed at you "
+                            f"that requires your expertise. Otherwise produce EMPTY output."
+                        ),
+                    )
+                )
         else:
             # Direct user message
             user_name = f"User {context.user_id}"  # Default fallback

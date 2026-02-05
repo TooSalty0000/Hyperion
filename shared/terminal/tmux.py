@@ -322,3 +322,17 @@ class TmuxBackend(TerminalBackend):
         except Exception:
             pass
         return None
+
+    def get_foreground_process(self) -> Optional[str]:
+        """Get the name of the foreground process in tmux."""
+        try:
+            result = subprocess.run(
+                ["tmux", "list-panes", "-t", self.session_name,
+                 "-F", "#{pane_current_command}"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip().split('\n')[0]
+        except Exception:
+            pass
+        return None

@@ -433,27 +433,14 @@ class AltairCore(commands.Cog, AgentAcknowledgmentMixin):
             )
             return
 
-        # Pre-enqueue check: Should we respond at all?
+        # Pre-enqueue check: Log conversational agent mentions (but don't block)
         if is_from_agent:
-            # Check if this is a genuine task dispatch (mention at start)
-            # vs. casual mention in another agent's conversational response.
-            # Real dispatches from the job graph executor always start with
-            # our @mention. Conversational messages embed mentions mid-text.
-            if not self._is_agent_dispatch(message):
+            has_node_marker = parse_node_marker(clean_content) is not None
+            if not has_node_marker and not self._is_agent_dispatch(message):
                 logger.info(
-                    f"[Altair] SKIPPING casual agent mention: '{clean_content[:50]}...' - "
-                    f"not a direct dispatch (mention not at start of message)"
+                    f"[Altair] Conversational agent mention (no node marker): "
+                    f"'{clean_content[:50]}...' - passing to LLM for decision"
                 )
-                return
-        else:
-            # Check for casual mentions from users that don't need a response
-            should_respond = await self._should_respond_to_mention(message, clean_content)
-            if not should_respond:
-                logger.info(
-                    f"[Altair] SKIPPING casual mention: '{clean_content[:50]}...' - "
-                    f"utility LLM decided no response needed"
-                )
-                return
 
         # User (not agent) message while task is active in this channel →
         # don't enqueue, let the running task's _fetch_new_messages_since() handle it
@@ -725,93 +712,6 @@ class AltairCore(commands.Cog, AgentAcknowledgmentMixin):
 
         return False
 
-    async def _should_respond_to_mention(
-        self,
-        message: discord.Message,
-        clean_content: str,
-    ) -> bool:
-        """
-        Use utility LLM to quickly decide if we should respond to this mention.
-
-        Returns False for casual mentions, greetings, or when we're just being
-        discussed rather than asked to do something.
-        """
-        # Quick pattern checks for obvious cases (save LLM call)
-        content_lower = clean_content.lower().strip()
-
-        # Always respond to direct questions or commands
-        if any(word in content_lower for word in [
-            "please", "can you", "could you", "would you", "help me",
-            "run", "execute", "start", "create", "check", "look at",
-            "what is", "how do", "why", "show me", "tell me",
-        ]):
-            return True
-
-        # Check if utility LLM is available
-        if not self.agent or not self.agent.utility_llm:
-            # No utility LLM, default to responding
-            return True
-
-        # Gather recent context
-        recent_context = []
-        try:
-            async for msg in message.channel.history(limit=5, before=message):
-                if msg.content:
-                    author = msg.author.display_name
-                    recent_context.append(f"[{author}]: {msg.content[:100]}")
-            recent_context.reverse()
-        except Exception:
-            pass
-
-        context_str = "\n".join(recent_context[-3:]) if recent_context else "(no recent messages)"
-
-        # Quick LLM evaluation
-        from shared.llm.types import Message, Role
-        prompt = f"""You are deciding whether an AI agent named Altair should respond to a Discord message.
-
-Altair is a CLI/terminal specialist. He should ONLY respond when:
-- Someone is asking him specifically to do something (run commands, check files, etc.)
-- Someone is asking him a direct question
-- He is being assigned a task
-
-Altair should NOT respond when:
-- People are just chatting casually and happened to mention him
-- It's a general greeting to everyone (like "hi everyone" or "hello team")
-- Others are discussing him but not talking TO him
-- Another agent already handled the request
-- It's just social pleasantries or acknowledgments
-
-Recent conversation:
-{context_str}
-
-Message that mentioned Altair:
-[{message.author.display_name}]: {clean_content}
-
-Should Altair respond to this message? Answer only YES or NO."""
-
-        try:
-            response = await self.agent.utility_llm.generate(
-                messages=[Message(role=Role.USER, content=prompt)],
-                temperature=0.0,
-                max_tokens=10,
-            )
-
-            answer = response.content.strip().upper() if response.content else "YES"
-            should_respond = "YES" in answer
-
-            if not should_respond:
-                logger.info(
-                    f"[Altair] Utility LLM says NO RESPONSE needed for: "
-                    f"'{clean_content[:40]}...'"
-                )
-
-            return should_respond
-
-        except Exception as e:
-            logger.warning(f"[Altair] Utility LLM check failed: {e}")
-            # On error, default to responding
-            return True
-
     def _is_noise_response(self, content: str) -> bool:
         """
         Check if a response is just noise (acknowledgments, short phrases).
@@ -994,8 +894,10 @@ Should Altair respond to this message? Answer only YES or NO."""
             for s in sessions:
                 status = "running" if s.is_alive else "stopped"
                 channel_ref = f"<#{s.channel_id}>" if s.channel_id else "(no channel)"
+                session_mode = getattr(s.data, 'mode', 'shell')
+                mode_info = " (CC)" if session_mode == "claude_code" else ""
                 project_info = f" [{s.data.project_name}]" if s.data.project_name else ""
-                lines.append(f"- #{s.session_id}: [{status}]{project_info} {channel_ref} PID {s.data.pid}")
+                lines.append(f"- #{s.session_id}: [{status}]{mode_info}{project_info} {channel_ref} PID {s.data.pid}")
 
             await ctx.send("\n".join(lines))
         except Exception as e:
@@ -1106,9 +1008,11 @@ Should Altair respond to this message? Answer only YES or NO."""
             channel = self.bot.get_channel(session.channel_id)
             channel_ref = channel.mention if channel else "(deleted)"
             status = "running" if session.is_alive else "stopped"
+            session_mode = getattr(session.data, 'mode', 'shell')
+            mode_info = " (CC)" if session_mode == "claude_code" else ""
             project_info = f" [{session.data.project_name}]" if session.data.project_name else ""
             embed.add_field(
-                name=f"#{session.session_id} [{status}]{project_info}",
+                name=f"#{session.session_id} [{status}]{mode_info}{project_info}",
                 value=f"Channel: {channel_ref}\nPID: {session.data.pid}",
                 inline=False
             )
@@ -1144,8 +1048,10 @@ Should Altair respond to this message? Answer only YES or NO."""
             await message.channel.send("Not in a CLI session.")
             return
 
+        session_mode = getattr(session.data, 'mode', 'shell')
         embed = discord.Embed(title=f"Session #{session.session_id}", color=0x00ff00)
         embed.add_field(name="Running", value=str(session.is_alive))
+        embed.add_field(name="Mode", value="Claude Code" if session_mode == "claude_code" else "Shell")
         embed.add_field(name="PID", value=str(session.data.pid))
         if session.data.project_name:
             embed.add_field(name="Project", value=session.data.project_name)

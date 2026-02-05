@@ -91,12 +91,75 @@ class StartClaudeCodeTool(Tool):
             # Send command with enter
             await session.terminal.send_input(cmd + "\n")
 
+            # Track mode change
+            if context.session_registry:
+                await context.session_registry.update_mode(sid, "claude_code")
+
             mode = "resuming existing conversation" if continue_session else "starting fresh"
             return f"Started Claude Code in session #{sid} ({mode}). Claude is ready to receive instructions."
 
         except Exception as e:
             logger.error(f"Error starting Claude Code: {e}", exc_info=True)
             return f"Error starting Claude Code: {str(e)}"
+
+
+class ExitClaudeCodeTool(Tool):
+    """Exit Claude Code in a session, returning to the shell."""
+
+    @property
+    def name(self) -> str:
+        return "exit_claude_code"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Exit Claude Code in a terminal session, returning to the shell prompt. "
+            "Use this when you need to run shell commands directly and Claude Code is active. "
+            "After exiting, use send_cli_command to run shell commands."
+        )
+
+    @property
+    def parameters(self) -> List[ToolParameter]:
+        return [
+            ToolParameter(
+                name="session_id",
+                type="integer",
+                description="Session ID. Uses current session if not provided.",
+                required=False,
+            ),
+        ]
+
+    async def execute(self, context: ToolContext, session_id: int = None) -> str:
+        if not context.session_registry:
+            return "Error: Session registry not available."
+
+        sid = session_id or context.current_session_id
+        if not sid:
+            return "Error: No session specified and no current session set."
+
+        try:
+            session = await context.session_registry.get_session(sid)
+            if not session:
+                return f"Error: Session #{sid} not found."
+
+            if not session.is_alive:
+                return f"Error: Session #{sid} is not running."
+
+            session_mode = getattr(session.data, 'mode', 'shell')
+            if session_mode != "claude_code":
+                return f"Session #{sid} is already in shell mode."
+
+            # Send /exit to Claude Code
+            await session.terminal.send_input("/exit\n")
+            await asyncio.sleep(1.5)  # Wait for CC to exit
+
+            # Update mode
+            await context.session_registry.update_mode(sid, "shell")
+            return f"Exited Claude Code in session #{sid}. Session is now in shell mode."
+
+        except Exception as e:
+            logger.error(f"Error exiting Claude Code: {e}", exc_info=True)
+            return f"Error exiting Claude Code: {str(e)}"
 
 
 class SendCLICommandTool(Tool):
@@ -133,6 +196,19 @@ class SendCLICommandTool(Tool):
         # Network/security
         (r'\bcurl\s+.*\|\s*(?:bash|sh)\b', "pipe remote script to shell"),
         (r'\bwget\s+.*\|\s*(?:bash|sh)\b', "pipe remote script to shell"),
+    ]
+
+    # Common shell command prefixes that shouldn't be sent to Claude Code
+    SHELL_COMMAND_PATTERNS = [
+        r'^(?:ls|cd|pwd|cat|head|tail|grep|find|mkdir|rmdir|rm|cp|mv|touch|chmod|chown)\b',
+        r'^(?:git|npm|pip|python|node|make|docker|curl|wget|ssh|scp)\b',
+        r'^(?:echo|export|source|which|env|set|unset|alias)\b',
+        r'^(?:ps|kill|top|df|du|free|uname|whoami|hostname)\b',
+        r'^(?:apt|brew|yum|dnf|pacman)\b',
+        r'^(?:tar|zip|unzip|gzip|gunzip)\b',
+        r'^\.\/',  # ./script
+        r'^\/',    # /absolute/path
+        r'^\~\/',  # ~/path
     ]
 
     @property
@@ -173,6 +249,14 @@ class SendCLICommandTool(Tool):
                 return True, reason
         return False, ""
 
+    def _looks_like_shell_command(self, command: str) -> bool:
+        """Check if input looks like a shell command rather than a natural language instruction."""
+        cmd = command.strip()
+        for pattern in self.SHELL_COMMAND_PATTERNS:
+            if re.match(pattern, cmd, re.IGNORECASE):
+                return True
+        return False
+
     async def execute(
         self,
         context: ToolContext,
@@ -195,9 +279,22 @@ class SendCLICommandTool(Tool):
             if not session.is_alive:
                 return f"Error: Session #{sid} is not running."
 
-            # Check for dangerous commands
+            # Mode-aware behavior
+            session_mode = getattr(session.data, 'mode', 'shell')
+            if session_mode == "claude_code":
+                # In Claude Code mode, block shell commands
+                if self._looks_like_shell_command(command):
+                    return (
+                        f"Session #{sid} is in Claude Code mode. "
+                        f"Cannot send shell commands to Claude Code. "
+                        f"Either:\n"
+                        f"1. Use exit_claude_code first, then send the command\n"
+                        f"2. Create a separate shell session with create_session()"
+                    )
+
+            # Check for dangerous commands (only in shell mode)
             is_dangerous, reason = self._check_dangerous(command)
-            if is_dangerous and context.permission_manager and context.current_channel_id:
+            if session_mode != "claude_code" and is_dangerous and context.permission_manager and context.current_channel_id:
                 # Request permission from user
                 channel = context.discord_bot.get_channel(context.current_channel_id)
                 if channel:
@@ -466,10 +563,13 @@ class GetSessionStatusTool(Tool):
             backend = session.terminal.get_name()
             config = session.terminal.config
             channel_ref = f"<#{session.channel_id}>" if session.channel_id else "(no channel)"
+            session_mode = getattr(session.data, 'mode', 'shell')
+            mode_label = "Claude Code" if session_mode == "claude_code" else "Shell"
 
             return (
                 f"Session #{sid} Status:\n"
                 f"- Status: {status}\n"
+                f"- Mode: {mode_label}\n"
                 f"- Channel: {channel_ref}\n"
                 f"- PID: {pid}\n"
                 f"- Backend: {backend}\n"
@@ -513,9 +613,11 @@ class ListActiveSessionsTool(Tool):
             for session in sessions:
                 status = "Running" if session.is_alive else "Stopped"
                 channel_ref = f"<#{session.channel_id}>" if session.channel_id else "(no channel)"
+                session_mode = getattr(session.data, 'mode', 'shell')
+                mode_indicator = " [Claude Code]" if session_mode == "claude_code" else ""
                 note_str = f"\n  📝 {session.data.notes}" if session.data.notes else ""
                 lines.append(
-                    f"- Session #{session.session_id}: [{status}] {channel_ref} (PID: {session.data.pid}){note_str}"
+                    f"- Session #{session.session_id}: [{status}]{mode_indicator} {channel_ref} (PID: {session.data.pid}){note_str}"
                 )
 
             return '\n'.join(lines)

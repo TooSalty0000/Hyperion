@@ -63,6 +63,8 @@ class FileSessionStore(SessionStore):
                     workspace_dir=session_dict.get('workspace_dir'),
                     command=session_dict.get('command'),
                     project_name=session_dict.get('project_name'),
+                    notes=session_dict.get('notes'),
+                    mode=session_dict.get('mode', 'shell'),
                 )
                 self._sessions[session.session_id] = session
                 if session.channel_id:
@@ -87,6 +89,8 @@ class FileSessionStore(SessionStore):
                         'workspace_dir': s.workspace_dir,
                         'command': s.command,
                         'project_name': getattr(s, 'project_name', None),
+                        'notes': getattr(s, 'notes', None),
+                        'mode': getattr(s, 'mode', 'shell'),
                     }
                     for s in self._sessions.values()
                 ]

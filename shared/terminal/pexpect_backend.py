@@ -172,3 +172,7 @@ class PexpectBackend(TerminalBackend):
         if self.process:
             return self.process.pid
         return None
+
+    def get_foreground_process(self) -> Optional[str]:
+        """Not available for pexpect backend."""
+        return None

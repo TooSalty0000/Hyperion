@@ -168,8 +168,20 @@ class MonitorSessionTool(Tool):
             # Detect state
             result = self._analyze_output(recent, output_changed)
 
+            # Mode reconciliation
+            session_mode = getattr(session.data, 'mode', 'shell')
+            fg_process = session.terminal.get_foreground_process()
+            from shared.session.registry import _process_name_to_mode
+            detected_mode = _process_name_to_mode(fg_process)
+            if detected_mode and detected_mode != session_mode:
+                await context.session_registry.update_mode(sid, detected_mode)
+                session_mode = detected_mode
+
+            mode_label = "Claude Code" if session_mode == "claude_code" else "Shell"
+
             # Format response
             response_parts = [f"**Session #{sid} Status:** {result.state.value.upper()}"]
+            response_parts.append(f"🔧 Mode: {mode_label}")
             response_parts.append(f"📋 {result.message}")
 
             if result.prompt_detected:

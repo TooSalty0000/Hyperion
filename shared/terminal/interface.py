@@ -70,6 +70,11 @@ class TerminalBackend(ABC):
         """Get the process ID if available."""
         pass
 
+    @abstractmethod
+    def get_foreground_process(self) -> Optional[str]:
+        """Get the name of the foreground process (e.g. 'bash', 'claude')."""
+        pass
+
     @staticmethod
     @abstractmethod
     def is_available() -> bool:

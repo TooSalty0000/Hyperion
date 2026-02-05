@@ -1,9 +1,12 @@
 """Vega - Orchestrator agent with DAG-based planning."""
 
 import asyncio
+import os
+import re
 import time
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional, List, TYPE_CHECKING
 
 from shared.base_agent import BaseAgent, AgentContext, AgentResponse
@@ -19,6 +22,58 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_ROSTER_PATH = Path.home() / ".hyperion" / "vega" / "agents.md"
+
+_DEFAULT_ROSTER_CONTENT = """\
+# Agent Roster
+Vega reads this file to understand available agents. Edit descriptions here.
+
+## altair
+CLI specialist. Runs commands, edits code, manages terminal sessions, filesystem operations.
+
+## polaris
+Calendar specialist. Google Calendar CRUD, scheduling, time management.
+
+## canopus
+Web specialist. Browser automation, web research, data extraction.
+"""
+
+
+def _load_agent_roster(path: Path = _ROSTER_PATH) -> dict[str, str]:
+    """Parse agents.md into {name: description} dict.
+
+    Format: ``## agent_name`` header followed by description paragraph(s).
+    Creates the file with default content on first run.
+    """
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_DEFAULT_ROSTER_CONTENT)
+        logger.info(f"Created default agent roster at {path}")
+
+    text = path.read_text()
+    roster: dict[str, str] = {}
+    current_name: str | None = None
+    current_lines: list[str] = []
+
+    for line in text.splitlines():
+        header_match = re.match(r"^##\s+(\S+)", line)
+        if header_match:
+            # Save previous agent
+            if current_name is not None:
+                roster[current_name] = " ".join(current_lines).strip()
+            current_name = header_match.group(1).lower()
+            current_lines = []
+        elif current_name is not None:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                current_lines.append(stripped)
+
+    # Save last agent
+    if current_name is not None:
+        roster[current_name] = " ".join(current_lines).strip()
+
+    return roster
+
 
 # Vega's persona - orchestrator with DAG-based planning
 VEGA_PERSONA = """=== IDENTITY: YOU ARE VEGA ===
@@ -28,10 +83,7 @@ WHO YOU ARE:
 Sharp, thoughtful, and efficient. You genuinely enjoy solving problems and orchestrating complex work. You're not afraid to admit when you don't know something. Keep responses concise - you're chatting, not writing essays.
 
 YOUR ROLE - ORCHESTRATOR:
-You are the brain. You plan, delegate, and synthesize. You NEVER run commands or browse the web yourself - you dispatch that work to specialized agents:
-- **Altair**: CLI specialist. Runs commands, edits code, manages terminal sessions, filesystem operations.
-- **Polaris**: Calendar specialist. Google Calendar CRUD, scheduling, time management.
-- **Canopus**: Web specialist. Browser automation, web research, data extraction.
+You are the brain. You plan, delegate, and synthesize. You NEVER run commands or browse the web yourself - you dispatch that work to specialized agents listed in the AGENT ROSTER section below.
 
 WHEN TO USE PLANS vs DIRECT RESPONSES:
 - **Direct response (NO plan needed)**: Simple greetings, basic facts, questions you can answer from knowledge alone, casual conversation.
@@ -45,15 +97,20 @@ The graph tools are for COORDINATION, not for every response. Keep it simple whe
 HOW YOU WORK - JOB GRAPHS:
 You orchestrate work using job DAGs (directed acyclic graphs).
 
-**IMPORTANT - CHECK FOR EXISTING GRAPHS FIRST:**
-Before creating a new plan, ALWAYS check the "ACTIVE JOB GRAPHS" section below. If there's an active graph for the current conversation:
-1. **Related message?** → Use `add_nodes` to extend the existing graph. Do NOT create a new plan.
-2. **Completely different task?** → OK to create a new plan with `create_plan`.
-3. **Follow-up question while work is in progress?** → Wait for agents or use `add_nodes` to queue follow-up work.
+**CRITICAL RULE - NEVER CREATE REDUNDANT PLANS:**
+Before calling `create_plan`, you MUST check the "ACTIVE JOB GRAPHS" section in this prompt.
 
-The goal is to keep related work in ONE graph. Only create a new graph when:
-- There are NO active graphs for this channel, OR
-- The user is clearly asking about something COMPLETELY UNRELATED to any active work
+- If ANY active graph exists in this channel → use `add_nodes` to extend it, NOT `create_plan`
+- If the user's message is a follow-up, clarification, or continuation → use `add_nodes` or just `respond_to_user` with the existing graph_id
+- If the user asks a simple question while work is in progress → just call `respond_to_user` with the graph_id (no new nodes needed)
+- ONLY use `create_plan` when there are ZERO active graphs, OR the user explicitly starts a COMPLETELY UNRELATED task
+
+The system will warn you if you create a plan when active graphs exist. Repeated warnings mean you're doing it wrong.
+
+**QUICK RESPONSES (most follow-ups):**
+If the user's message is a simple question, clarification, or acknowledgment during active work:
+→ Just call `respond_to_user` with the active graph_id. No new nodes needed.
+Only add dispatch nodes when you actually need an agent to do work.
 
 **STANDARD FLOW (for tasks requiring agents):**
 1. Check active graphs (below). If related, use `add_nodes`. If not, call `create_plan`.
@@ -63,9 +120,9 @@ The goal is to keep related work in ONE graph. Only create a new graph when:
 5. When the goal is met, call `respond_to_user` with the final answer
 
 NODE TYPES:
-- `think`: You reason internally (no external dispatch). Mark complete with `update_node` when done.
+- `think`: Internal reasoning step. Auto-completed by the system to unblock dependent nodes.
 - `dispatch`: Sends @mention to an agent. Set appropriate timeout (300s default).
-- `respond`: Delivers final answer to user. Use `respond_to_user` tool.
+- `respond`: Delivers final answer to user via `respond_to_user`. Auto-depends on all work nodes if you omit dependencies — so it runs last.
 
 TIMEOUT GUIDELINES:
 - Quick status check: 300s
@@ -77,7 +134,7 @@ TIMEOUT GUIDELINES:
 CHAT HISTORY:
 Messages appear as "[Name]: message".
 - "[Vega]:" = YOUR previous messages
-- "[Altair]:", "[Polaris]:", "[Canopus]:" = Agent responses
+- "[AgentName]:" = Agent responses (e.g. [Altair], [Polaris], etc.)
 - "[Username]:" = User messages
 
 CRITICAL RULES:
@@ -98,22 +155,16 @@ When the user cancels a task (agent reports "stopped", "cancelled", "permission 
    - Or acknowledge the cancellation with `respond_to_user`
 3. Never leave the user hanging after a cancellation - always take action.
 
-MEETING ROOMS & DEPARTMENTS:
-When you create a plan with dispatch nodes, the system creates a temporary "meeting room" channel.
-Meeting rooms are deleted when the plan completes.
-
-For long-term or recurring projects, use `propose_department` to convert a meeting room into
-a persistent "department" channel. This sends an approval request with buttons to the user.
-If approved, the channel persists and is reused for future work on the same project.
+DISPATCHES & DEPARTMENTS:
+Agent dispatches happen in the main channel by default — no separate channels are created.
+For long-term projects, use `propose_department` to create a persistent workspace channel.
+Pass the `project` parameter in create_plan to route dispatches to an existing department.
 
 WHEN TO PROPOSE A DEPARTMENT:
 - The project will need multiple rounds of work over time
 - The user explicitly asks for a persistent workspace
 - You've done 2+ plans for the same project topic
 Do NOT propose departments for one-off tasks.
-
-USING EXISTING DEPARTMENTS:
-Pass the `project` parameter in create_plan to auto-route to an existing department.
 
 CLOSING DEPARTMENTS:
 Use close_department to propose closing an inactive department.
@@ -179,10 +230,16 @@ class VegaAgent(BaseAgent):
         from shared.memory.tools import get_memory_tools
         from shared.soul.tools import get_soul_tools
 
+        # Derive dispatchable agent names from registry (exclude vega herself)
+        agent_names = [
+            name for name in sorted(self.agent_registry.keys())
+            if name != "vega"
+        ] or None  # None → defaults inside get_graph_tools
+
         # Register job graph tools (create_plan, add_nodes, update_node, cancel_nodes, respond_to_user)
-        for tool in get_graph_tools():
+        for tool in get_graph_tools(agent_names):
             self._tools.register(tool)
-        logger.info("Registered graph orchestration tools")
+        logger.info(f"Registered graph tools with agents: {agent_names}")
 
         # Register department tools (propose_department, close_department)
         for tool in get_department_tools():
@@ -227,7 +284,22 @@ class VegaAgent(BaseAgent):
         now = datetime.now(timezone.utc)
         current_time_str = now.strftime("%A, %B %d, %Y at %H:%M UTC")
 
+        # Build agent roster from registry + descriptions file
+        roster_desc = _load_agent_roster()
+        agent_names = [
+            name for name in sorted(self.agent_registry.keys())
+            if name != "vega"
+        ]
+        roster_lines = []
+        for name in agent_names:
+            desc = roster_desc.get(name, "Available agent.")
+            roster_lines.append(f"- **{name.capitalize()}**: {desc}")
+        roster_section = "\n".join(roster_lines) if roster_lines else "No agents registered."
+
         base_prompt = f"""{self.persona}
+
+AGENT ROSTER:
+{roster_section}
 
 CURRENT TIME: {current_time_str}
 
@@ -510,7 +582,9 @@ When you need to recall past information, check your active context above or use
         user_name = f"User {context.user_id}"  # Default fallback
         if self.discord_bot:
             try:
-                user = await self.discord_bot.fetch_user(context.user_id)
+                user = self.discord_bot.get_user(context.user_id)
+                if not user:
+                    user = await self.discord_bot.fetch_user(context.user_id)
                 user_name = user.display_name or user.name
             except Exception:
                 pass

@@ -120,12 +120,17 @@ Sometimes the best response is NO response. Do NOT reply when:
 - The message mentions dates/times but isn't asking YOU to do anything
 - Someone is giving you INSTRUCTIONS or GUIDELINES (not a task)
 - Vega is telling agents what to do/not do - that's a directive, not a task
+- A message from another agent WITHOUT a [node:graph_id:node_id] dispatch marker
+  (These are conversational mentions — the agent is talking ABOUT you, not TO you)
+- Messages where you're mentioned as part of a status update, report, or narrative
 
 If you're uncertain whether to reply, consider:
 1. Was I directly asked to DO something specific with the calendar?
 2. Does this require scheduling, events, or time management with a concrete deliverable?
 3. Has someone else already addressed this?
 4. Would my response add VALUE or just add NOISE?
+5. Does this message have a dispatch marker [node:*:*]? If YES, it's a real task.
+   If NO and it's from another agent, it's almost certainly conversational — stay silent.
 
 === HOW TO NOT REPLY (THIS IS CRUCIAL) ===
 When you decide NOT to reply, you must produce LITERALLY EMPTY OUTPUT.
@@ -592,18 +597,34 @@ When you learn scheduling preferences or recurring patterns, use store_memory to
 
         # Frame the current message based on source
         if context.is_from_agent:
-            # Dispatch from Vega/another agent — frame as authoritative directive
-            messages.append(
-                Message(
-                    role=Role.USER,
-                    content=(
-                        f"[DISPATCH FROM VEGA - THIS IS YOUR TASK]:\n"
-                        f"{context.message_content}\n\n"
-                        f"Do EXACTLY this task. The chat history above is for context only. "
-                        f"Do not infer additional work beyond what is stated here."
-                    ),
+            if context.node_marker:
+                # Real dispatch with node marker — authoritative task
+                messages.append(
+                    Message(
+                        role=Role.USER,
+                        content=(
+                            f"[DISPATCH FROM VEGA - THIS IS YOUR TASK]:\n"
+                            f"{context.message_content}\n\n"
+                            f"Do EXACTLY this task. The chat history above is for context only. "
+                            f"Do not infer additional work beyond what is stated here."
+                        ),
+                    )
                 )
-            )
+            else:
+                # Agent mention without dispatch marker — likely conversational
+                messages.append(
+                    Message(
+                        role=Role.USER,
+                        content=(
+                            f"[AGENT MESSAGE - EVALUATE BEFORE RESPONDING]:\n"
+                            f"{context.message_content}\n\n"
+                            f"This message is from another agent but has NO dispatch marker. "
+                            f"It is likely a conversational mention, not a task assigned to you. "
+                            f"Only respond if there is a clear, actionable request directed at you "
+                            f"that requires your expertise. Otherwise produce EMPTY output."
+                        ),
+                    )
+                )
         else:
             # Direct user message
             user_name = f"User {context.user_id}"

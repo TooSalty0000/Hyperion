@@ -34,7 +34,6 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
     Routing:
     - User messages → trigger new Vega process cycle (with executor context)
     - Agent messages → matched to running graph nodes → trigger Vega re-evaluation
-    - Thread messages (planning threads) → ignored
     - Timeout loop → checks for stuck nodes periodically
     """
 
@@ -267,15 +266,9 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
             )
             return
 
-        # Ignore messages in planning threads (Vega's own status updates)
-        if self.executor and isinstance(message.channel, discord.Thread):
-            graph = self.executor.get_graph_by_thread(message.channel.id)
-            if graph:
-                return  # This is a planning thread, ignore
-
         # Passive context monitoring — observe after filtering out
-        # self-messages (line 254) and planning threads (above) so that
-        # internal orchestration noise never enters the sentinel buffer.
+        # self-messages (line 254) so that internal orchestration noise
+        # never enters the sentinel buffer.
         if self.sentinel:
             await self.sentinel.observe(message, self._agent_registry)
 
@@ -418,15 +411,6 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
             f"[Vega] Agent '{agent_name}' responded to node '{node.id}' "
             f"in graph '{graph.id}'"
         )
-
-        # Post agent response embed to the planning thread
-        import discord as _discord
-        content_preview = message.content[:300] if message.content else "(no text)"
-        embed = _discord.Embed(
-            description=f"**{agent_name}** → `{node.id}`\n{content_preview}",
-            color=0x5865F2,  # Blurple
-        )
-        await self.executor._send_to_thread(graph, embed=embed)
 
         # Use the graph's MAIN channel for re-evaluation context (not the meeting room).
         # This ensures respond_to_user targets the main channel.
@@ -619,9 +603,19 @@ class VegaCore(commands.Cog, AgentAcknowledgmentMixin):
                     if not target_channel:
                         return
 
+                    # Guard against runaway LLM output (repetition loops)
+                    MAX_RESPONSE_LEN = 4000
+                    raw_content = response.content
+                    if len(raw_content) > MAX_RESPONSE_LEN:
+                        logger.warning(
+                            f"[Vega] Truncating response from {len(raw_content)} "
+                            f"to {MAX_RESPONSE_LEN} chars (likely LLM repetition)"
+                        )
+                        raw_content = raw_content[:MAX_RESPONSE_LEN].rsplit('\n', 1)[0]
+
                     # Convert @Name text to actual Discord mentions
                     content = await convert_text_mentions_to_discord(
-                        response.content,
+                        raw_content,
                         target_channel,
                         self._agent_registry,
                     )
